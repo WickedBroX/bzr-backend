@@ -43,10 +43,12 @@ const cache = {
   infoTimestamp: 0,
   transfers: null,
   transfersTimestamp: 0,
+  stats: null, // [Milestone 2.3] Cache for stats
+  statsTimestamp: 0,
 };
 
 const FIVE_MINUTES = 5 * 60 * 1000;
-const TWO_MINUTES = 2 * 60 * 1000;
+const TWO_MINUTES = 2 * 60 * 1000; // Transfers and Stats are cached for 2 mins
 
 /**
  * [Milestone 2.2]
@@ -62,26 +64,59 @@ const fetchTransfersForChain = async (chain) => {
     action: 'tokentx',
     contractaddress: BZR_ADDRESS,
     page: 1,
-    offset: 50, // Get the latest 50 transfers from this chain
+    offset: 50,
     sort: 'desc',
   };
 
   try {
     const response = await axios.get(API_V2_BASE_URL, { params });
     if (response.data.status === '1') {
-      // Add the chain name to each transaction object
       return response.data.result.map(tx => ({
         ...tx,
         chainName: chain.name,
         chainId: chain.id,
       }));
     } else {
-      console.warn(`! No transfers found or API error on chain ${chain.name}: ${response.data.message}`);
-      return []; // Return empty array on API error (e.g., "No transactions found")
+      console.warn(`! No transfers found on chain ${chain.name}: ${response.data.message}`);
+      return [];
     }
   } catch (error) {
     console.error(`X Failed to fetch transfers for chain ${chain.name}: ${error.message}`);
-    return null; // Return null on critical network error
+    return null; // null on critical error
+  }
+};
+
+/**
+ * [Milestone 2.3]
+ * Fetches token holder count for a single chain.
+ * @param {object} chain - A chain object { id, name }
+ * @returns {Promise<object>} A promise that resolves to a stats object.
+ */
+const fetchStatsForChain = async (chain) => {
+  const params = {
+    chainid: chain.id,
+    apikey: API_KEY,
+    module: 'token',
+    action: 'tokenholdercount',
+    contractaddress: BZR_ADDRESS,
+  };
+
+  try {
+    const response = await axios.get(API_V2_BASE_URL, { params });
+    if (response.data.status === '1') {
+      return {
+        chainName: chain.name,
+        chainId: chain.id,
+        holderCount: parseInt(response.data.result, 10),
+      };
+    } else {
+      console.warn(`! No stats found on chain ${chain.name}: ${response.data.message}`);
+      // Return 0 if API says "No transactions found" or similar error
+      return { chainName: chain.name, chainId: chain.id, holderCount: 0 };
+    }
+  } catch (error) {
+    console.error(`X Failed to fetch stats for chain ${chain.name}: ${error.message}`);
+    return null; // null on critical network error
   }
 };
 
@@ -90,14 +125,11 @@ const fetchTransfersForChain = async (chain) => {
 // [Milestone 2.1] - Token Info
 app.get('/api/info', async (req, res) => {
   console.log(`[${new Date().toISOString()}] Received request for /api/info`);
-
-  // --- Caching Logic ---
   const now = Date.now();
   if (cache.info && (now - cache.infoTimestamp < FIVE_MINUTES)) {
     console.log('-> Returning cached /api/info data.');
     return res.json(cache.info);
   }
-  // --- End Caching Logic ---
 
   if (!API_KEY || !BZR_ADDRESS) {
     return res.status(500).json({ message: 'Server is missing API_KEY or BZR_ADDRESS' });
@@ -235,14 +267,55 @@ app.get('/api/transfers', async (req, res) => {
   }
 });
 
+// [Milestone 2.3] - All Stats (Holders)
+app.get('/api/stats', async (req, res) => {
+  console.log(`[${new Date().toISOString()}] Received request for /api/stats`);
+  const now = Date.now();
+  if (cache.stats && (now - cache.statsTimestamp < TWO_MINUTES)) {
+    console.log('-> Returning cached /api/stats data.');
+    return res.json(cache.stats);
+  }
+
+  console.log('-> Fetching new /api/stats data from 10 chains...');
+  try {
+    const allPromises = CHAINS.map(chain => fetchStatsForChain(chain));
+    const allResults = await Promise.allSettled(allPromises);
+    let allStats = [];
+    let totalHolders = 0; // We'll sum this up for a total count
+
+    allResults.forEach((result, index) => {
+      if (result.status === 'fulfilled' && result.value) {
+        allStats.push(result.value);
+        totalHolders += result.value.holderCount;
+      } else if (result.status === 'rejected') {
+        console.error(`X Critical error fetching stats from ${CHAINS[index].name}: ${result.reason}`);
+      }
+    });
+
+    // Sort by holder count, descending
+    allStats.sort((a, b) => b.holderCount - a.holderCount);
+
+    const response = {
+      totalHolders,
+      chains: allStats,
+    };
+
+    console.log(`-> Aggregated stats. Total holders (estimated): ${totalHolders}.`);
+    cache.stats = response;
+    cache.statsTimestamp = Date.now();
+    res.json(response);
+  } catch (error) {
+    console.error('Error in /api/stats handler:', error.message);
+    res.status(500).json({ message: 'Failed to fetch stats', error: error.message });
+  }
+});
+
 // [Milestone 4.1] - Admin Panel
-// We will add this at the end to manage API keys
 // TODO: Build admin routes
 
 // --- Health Check Route ---
-// A simple route to make sure the server is alive
 app.get('/', (req, res) => {
-  res.send('BZR Token Explorer Backend is running! (v3: /api/info and /api/transfers are live)');
+  res.send('BZR Token Explorer Backend is running! (v4: ALL ENDPOINTS LIVE)');
 });
 
 // --- Start Server ---
