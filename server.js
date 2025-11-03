@@ -44,12 +44,14 @@ const cache = {
   infoTimestamp: 0,
   transfers: null,
   transfersTimestamp: 0,
+  transfersChainStatus: [],
   stats: null, // [Milestone 2.3] Cache for stats
   statsTimestamp: 0,
 };
 
 const FIVE_MINUTES = 5 * 60 * 1000;
 const TWO_MINUTES = 2 * 60 * 1000; // Transfers and Stats are cached for 2 mins
+const CACHE_WARM_INTERVAL_MS = Number(process.env.CACHE_WARM_INTERVAL_MS || 90_000);
 
 const toNumericTimestamp = (timestamp) => {
   const parsed = Number(timestamp);
@@ -85,6 +87,102 @@ const mapWithConcurrency = async (items, limit, task) => {
 
   await Promise.all(Array.from({ length: workerCount }, worker));
   return results;
+};
+
+let transfersRefreshPromise = null;
+
+const buildTransfersResponsePayload = (isStale = false) => ({
+  data: Array.isArray(cache.transfers) ? cache.transfers : [],
+  chains: Array.isArray(cache.transfersChainStatus) ? cache.transfersChainStatus : [],
+  timestamp: cache.transfersTimestamp || null,
+  stale: Boolean(isStale),
+});
+
+const updateTransfersCache = async () => {
+  console.log('-> Refreshing /api/transfers cache from 10 chains...');
+  const allResults = await mapWithConcurrency(
+    CHAINS,
+    MAX_CONCURRENT_REQUESTS,
+    (chain) => fetchTransfersForChain(chain)
+  );
+
+  let allTransfers = [];
+  const chainStatuses = CHAINS.map((chain, index) => {
+    const result = allResults[index];
+
+    if (result && result.status === 'fulfilled' && Array.isArray(result.value)) {
+      const sanitized = result.value
+        .filter((tx) => {
+          if (!tx || typeof tx.timeStamp === 'undefined') {
+            console.warn(`! Skipping transfer with missing timestamp on ${chain.name}`);
+            return false;
+          }
+          if (!Number.isFinite(Number(tx.timeStamp))) {
+            console.warn(`! Skipping transfer with non-numeric timestamp on ${chain.name}`);
+            return false;
+          }
+          return true;
+        })
+        .map((tx) => ({
+          ...tx,
+          timeStamp: String(tx.timeStamp),
+        }));
+
+      allTransfers.push(...sanitized);
+
+      return {
+        chainId: chain.id,
+        chainName: chain.name,
+        status: 'ok',
+        transferCount: sanitized.length,
+      };
+    }
+
+    const errorReason = result?.status === 'rejected'
+      ? result.reason?.message || String(result.reason)
+      : 'Upstream response unavailable';
+
+    if (result?.status === 'rejected') {
+      console.error(`X Critical error fetching from chain ${chain.name}: ${errorReason}`);
+    } else {
+      console.error(`X Failed to fetch transfers for chain ${chain.name}: ${errorReason}`);
+    }
+
+    return {
+      chainId: chain.id,
+      chainName: chain.name,
+      status: 'error',
+      transferCount: 0,
+      error: errorReason,
+    };
+  });
+
+  allTransfers.sort((a, b) => toNumericTimestamp(b.timeStamp) - toNumericTimestamp(a.timeStamp));
+
+  cache.transfers = allTransfers;
+  cache.transfersTimestamp = Date.now();
+  cache.transfersChainStatus = chainStatuses;
+
+  console.log(`-> Cached ${allTransfers.length} transfers (updated ${new Date(cache.transfersTimestamp).toISOString()}).`);
+
+  return allTransfers;
+};
+
+const triggerTransfersRefresh = () => {
+  if (transfersRefreshPromise) {
+    return transfersRefreshPromise;
+  }
+
+  transfersRefreshPromise = updateTransfersCache()
+    .catch((error) => {
+      console.error('X Failed to refresh transfers cache:', error.message || error);
+      throw error;
+    })
+    .finally(() => {
+      transfersRefreshPromise = null;
+    });
+
+  return transfersRefreshPromise;
 };
 
 /**
@@ -263,72 +361,47 @@ app.get('/api/info', async (req, res) => {
 app.get('/api/transfers', async (req, res) => {
   console.log(`[${new Date().toISOString()}] Received request for /api/transfers`);
 
-  // --- Caching Logic ---
+  const forceRefresh = String(req.query.force).toLowerCase() === 'true';
   const now = Date.now();
-  if (cache.transfers && (now - cache.transfersTimestamp < TWO_MINUTES)) {
-    console.log('-> Returning cached /api/transfers data.');
-    return res.json(cache.transfers);
-  }
-  // --- End Caching Logic ---
+  const cacheAge = cache.transfersTimestamp ? now - cache.transfersTimestamp : Infinity;
+  const hasCache = Array.isArray(cache.transfers) && cache.transfersTimestamp;
+  const isFresh = cacheAge < TWO_MINUTES;
 
-  console.log('-> Fetching new /api/transfers data from 10 chains...');
-
-  try {
-    // 1. Create an array of promises, one for each chain
-    const allResults = await mapWithConcurrency(
-      CHAINS,
-      MAX_CONCURRENT_REQUESTS,
-      (chain) => fetchTransfersForChain(chain)
-    );
-
-    // 3. Aggregate all successful results
-    let allTransfers = [];
-    allResults.forEach((result, index) => {
-      if (result.status === 'fulfilled' && result.value) {
-        // result.value is the array of transactions from fetchTransfersForChain
-        const sanitized = result.value
-          .filter((tx) => {
-            if (!tx || typeof tx.timeStamp === 'undefined') {
-              console.warn(`! Skipping transfer with missing timestamp on ${CHAINS[index].name}`);
-              return false;
-            }
-            if (!Number.isFinite(Number(tx.timeStamp))) {
-              console.warn(`! Skipping transfer with non-numeric timestamp on ${CHAINS[index].name}`);
-              return false;
-            }
-            return true;
-          })
-          .map((tx) => ({
-            ...tx,
-            timeStamp: String(tx.timeStamp),
-          }));
-
-        allTransfers.push(...sanitized);
-      } else if (result.status === 'rejected') {
-        console.error(`X Critical error fetching from chain ${CHAINS[index].name}: ${result.reason}`);
-      }
-    });
-
-    console.log(`-> Aggregated ${allTransfers.length} total transfers from all chains.`);
-
-    // 4. Sort the combined list by timestamp (most recent first)
-    allTransfers.sort((a, b) => toNumericTimestamp(b.timeStamp) - toNumericTimestamp(a.timeStamp));
-
-    // 5. Cache and send the response
-    cache.transfers = allTransfers;
-    cache.transfersTimestamp = Date.now();
-
-    res.json(allTransfers);
-
-  } catch (error) {
-    console.error('Error in /api/transfers handler:', error.message);
-    if (error.response?.data) {
-      return respondUpstreamFailure(res, 'Failed to fetch transfers from Etherscan', {
-        upstreamResponse: error.response.data,
-      });
+  if (!hasCache || forceRefresh) {
+    if (!hasCache) {
+      console.log('-> No cached transfers available. Performing blocking refresh.');
+    } else if (forceRefresh) {
+      console.log('-> Force refresh requested. Waiting for fresh transfer data.');
     }
 
-    res.status(500).json({ message: 'Failed to fetch transfers', error: error.message });
+    try {
+      await triggerTransfersRefresh();
+      return res.json(buildTransfersResponsePayload(false));
+    } catch (error) {
+      console.error('Error in forced /api/transfers refresh:', error.message || error);
+      if (error.response?.data) {
+        return respondUpstreamFailure(res, 'Failed to fetch transfers from Etherscan', {
+          upstreamResponse: error.response.data,
+        });
+      }
+
+      return res.status(500).json({ message: 'Failed to fetch transfers', error: error.message || String(error) });
+    }
+  }
+
+  const isStale = !isFresh;
+  if (isStale) {
+    console.log('-> Returning stale cached /api/transfers data while refreshing in background.');
+  } else {
+    console.log('-> Returning fresh cached /api/transfers data.');
+  }
+
+  res.json(buildTransfersResponsePayload(isStale));
+
+  if (isStale) {
+    triggerTransfersRefresh().catch((error) => {
+      console.error('X Background refresh for /api/transfers failed:', error.message || error);
+    });
   }
 });
 
@@ -409,6 +482,7 @@ app.get('/api/cache-health', (req, res) => {
   res.json({
     info: withMeta(cache.info, cache.infoTimestamp, FIVE_MINUTES),
     transfers: withMeta(cache.transfers, cache.transfersTimestamp, TWO_MINUTES),
+    transferChains: cache.transfersChainStatus,
     stats: withMeta(cache.stats, cache.statsTimestamp, TWO_MINUTES),
     serverTime: new Date(now).toISOString(),
   });
@@ -439,5 +513,23 @@ app.listen(PORT, () => {
     console.warn('WARNING: BZR_TOKEN_ADDRESS is not set. Please set it in .env');
   } else {
     console.log(`Tracking BZR Token: ${BZR_ADDRESS}`);
+  }
+
+  if (CACHE_WARM_INTERVAL_MS > 0) {
+    console.log(`Cache warming enabled (interval ${CACHE_WARM_INTERVAL_MS}ms).`);
+
+    triggerTransfersRefresh().catch((error) => {
+      console.error('X Initial transfers cache warm failed:', error.message || error);
+    });
+
+    const interval = setInterval(() => {
+      triggerTransfersRefresh().catch((error) => {
+        console.error('X Scheduled transfers cache warm failed:', error.message || error);
+      });
+    }, CACHE_WARM_INTERVAL_MS);
+
+    if (typeof interval.unref === 'function') {
+      interval.unref();
+    }
   }
 });
