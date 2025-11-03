@@ -16,6 +16,7 @@ app.use(express.json());
 const API_KEY = process.env.ETHERSCAN_V2_API_KEY;
 const BZR_ADDRESS = process.env.BZR_TOKEN_ADDRESS;
 const API_V2_BASE_URL = 'https://api.etherscan.io/v2/api';
+const MAX_CONCURRENT_REQUESTS = Number(process.env.ETHERSCAN_CONCURRENCY || 3);
 console.log(`i API Base URL: ${API_V2_BASE_URL}`);
 
 // [Milestone 2.2] Define all 10 chains
@@ -49,6 +50,42 @@ const cache = {
 
 const FIVE_MINUTES = 5 * 60 * 1000;
 const TWO_MINUTES = 2 * 60 * 1000; // Transfers and Stats are cached for 2 mins
+
+const toNumericTimestamp = (timestamp) => {
+  const parsed = Number(timestamp);
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const respondUpstreamFailure = (res, message, details = {}) => {
+  return res.status(502).json({
+    message,
+    upstream: 'etherscan',
+    ...details,
+  });
+};
+
+const mapWithConcurrency = async (items, limit, task) => {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+
+  const worker = async () => {
+    while (true) {
+      const index = cursor++;
+      if (index >= items.length) break;
+
+      try {
+        const value = await task(items[index], index);
+        results[index] = { status: 'fulfilled', value };
+      } catch (error) {
+        results[index] = { status: 'rejected', reason: error };
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: workerCount }, worker));
+  return results;
+};
 
 /**
  * [Milestone 2.2]
@@ -173,10 +210,9 @@ app.get('/api/info', async (req, res) => {
     // Check for API errors
     if (supplyResponse.data.status !== '1' || txResponse.data.status !== '1') {
       console.error('Etherscan API Error:', supplyResponse.data.message, txResponse.data.message);
-      return res.status(500).json({ 
-        message: 'Error from Etherscan API', 
+      return respondUpstreamFailure(res, 'Upstream Etherscan API error while fetching token info', {
         supplyError: supplyResponse.data.message,
-        txError: txResponse.data.message 
+        txError: txResponse.data.message,
       });
     }
 
@@ -212,6 +248,12 @@ app.get('/api/info', async (req, res) => {
 
   } catch (error) {
     console.error('Error in /api/info handler:', error.message);
+    if (error.response?.data) {
+      return respondUpstreamFailure(res, 'Failed to fetch token info from Etherscan', {
+        upstreamResponse: error.response.data,
+      });
+    }
+
     res.status(500).json({ message: 'Failed to fetch token info', error: error.message });
   }
 });
@@ -233,18 +275,35 @@ app.get('/api/transfers', async (req, res) => {
 
   try {
     // 1. Create an array of promises, one for each chain
-    const allPromises = CHAINS.map(chain => fetchTransfersForChain(chain));
-
-    // 2. Run all fetches in parallel and wait for them all to finish
-    // We use 'allSettled' so that if one chain fails, the others still return data
-    const allResults = await Promise.allSettled(allPromises);
+    const allResults = await mapWithConcurrency(
+      CHAINS,
+      MAX_CONCURRENT_REQUESTS,
+      (chain) => fetchTransfersForChain(chain)
+    );
 
     // 3. Aggregate all successful results
     let allTransfers = [];
     allResults.forEach((result, index) => {
       if (result.status === 'fulfilled' && result.value) {
         // result.value is the array of transactions from fetchTransfersForChain
-        allTransfers.push(...result.value);
+        const sanitized = result.value
+          .filter((tx) => {
+            if (!tx || typeof tx.timeStamp === 'undefined') {
+              console.warn(`! Skipping transfer with missing timestamp on ${CHAINS[index].name}`);
+              return false;
+            }
+            if (!Number.isFinite(Number(tx.timeStamp))) {
+              console.warn(`! Skipping transfer with non-numeric timestamp on ${CHAINS[index].name}`);
+              return false;
+            }
+            return true;
+          })
+          .map((tx) => ({
+            ...tx,
+            timeStamp: String(tx.timeStamp),
+          }));
+
+        allTransfers.push(...sanitized);
       } else if (result.status === 'rejected') {
         console.error(`X Critical error fetching from chain ${CHAINS[index].name}: ${result.reason}`);
       }
@@ -253,7 +312,7 @@ app.get('/api/transfers', async (req, res) => {
     console.log(`-> Aggregated ${allTransfers.length} total transfers from all chains.`);
 
     // 4. Sort the combined list by timestamp (most recent first)
-    allTransfers.sort((a, b) => b.timeStamp - a.timeStamp);
+    allTransfers.sort((a, b) => toNumericTimestamp(b.timeStamp) - toNumericTimestamp(a.timeStamp));
 
     // 5. Cache and send the response
     cache.transfers = allTransfers;
@@ -263,6 +322,12 @@ app.get('/api/transfers', async (req, res) => {
 
   } catch (error) {
     console.error('Error in /api/transfers handler:', error.message);
+    if (error.response?.data) {
+      return respondUpstreamFailure(res, 'Failed to fetch transfers from Etherscan', {
+        upstreamResponse: error.response.data,
+      });
+    }
+
     res.status(500).json({ message: 'Failed to fetch transfers', error: error.message });
   }
 });
@@ -278,8 +343,11 @@ app.get('/api/stats', async (req, res) => {
 
   console.log('-> Fetching new /api/stats data from 10 chains...');
   try {
-    const allPromises = CHAINS.map(chain => fetchStatsForChain(chain));
-    const allResults = await Promise.allSettled(allPromises);
+    const allResults = await mapWithConcurrency(
+      CHAINS,
+      MAX_CONCURRENT_REQUESTS,
+      (chain) => fetchStatsForChain(chain)
+    );
     let allStats = [];
     let totalHolders = 0; // We'll sum this up for a total count
 
@@ -306,8 +374,44 @@ app.get('/api/stats', async (req, res) => {
     res.json(response);
   } catch (error) {
     console.error('Error in /api/stats handler:', error.message);
+    if (error.response?.data) {
+      return respondUpstreamFailure(res, 'Failed to fetch token holder stats from Etherscan', {
+        upstreamResponse: error.response.data,
+      });
+    }
+
     res.status(500).json({ message: 'Failed to fetch stats', error: error.message });
   }
+});
+
+app.get('/api/cache-health', (req, res) => {
+  const now = Date.now();
+
+  const withMeta = (data, timestamp, ttl) => {
+    if (!data || !timestamp) {
+      return {
+        status: 'empty',
+        ageMs: null,
+        ttlMs: ttl,
+        expiresInMs: null,
+      };
+    }
+
+    const age = now - timestamp;
+    return {
+      status: age < ttl ? 'fresh' : 'stale',
+      ageMs: age,
+      ttlMs: ttl,
+      expiresInMs: Math.max(ttl - age, 0),
+    };
+  };
+
+  res.json({
+    info: withMeta(cache.info, cache.infoTimestamp, FIVE_MINUTES),
+    transfers: withMeta(cache.transfers, cache.transfersTimestamp, TWO_MINUTES),
+    stats: withMeta(cache.stats, cache.statsTimestamp, TWO_MINUTES),
+    serverTime: new Date(now).toISOString(),
+  });
 });
 
 // [Milestone 4.1] - Admin Panel
