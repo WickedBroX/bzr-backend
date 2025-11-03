@@ -47,11 +47,18 @@ const cache = {
   transfersChainStatus: [],
   stats: null, // [Milestone 2.3] Cache for stats
   statsTimestamp: 0,
+  tokenPrice: null,
+  tokenPriceTimestamp: 0,
+  finality: null,
+  finalityTimestamp: 0,
 };
 
 const FIVE_MINUTES = 5 * 60 * 1000;
+
 const TWO_MINUTES = 2 * 60 * 1000; // Transfers and Stats are cached for 2 mins
 const CACHE_WARM_INTERVAL_MS = Number(process.env.CACHE_WARM_INTERVAL_MS || 90_000);
+const TOKEN_PRICE_TTL_MS = Number(process.env.TOKEN_PRICE_TTL_MS || 60_000);
+const FINALITY_TTL_MS = Number(process.env.FINALITY_TTL_MS || 30_000);
 
 const toNumericTimestamp = (timestamp) => {
   const parsed = Number(timestamp);
@@ -64,6 +71,19 @@ const respondUpstreamFailure = (res, message, details = {}) => {
     upstream: 'etherscan',
     ...details,
   });
+};
+
+const isProOnlyResponse = (payload = {}) => {
+  const segments = [];
+  if (typeof payload === 'string') {
+    segments.push(payload);
+  } else {
+    if (payload?.message) segments.push(payload.message);
+    if (payload?.result) segments.push(typeof payload.result === 'string' ? payload.result : JSON.stringify(payload.result));
+  }
+
+  const combined = segments.join(' ').toLowerCase();
+  return combined.includes('pro') && (combined.includes('endpoint') || combined.includes('plan'));
 };
 
 const mapWithConcurrency = async (items, limit, task) => {
@@ -252,6 +272,95 @@ const fetchStatsForChain = async (chain) => {
   } catch (error) {
     console.error(`X Failed to fetch stats for chain ${chain.name}: ${error.message}`);
     return null; // null on critical network error
+  }
+};
+
+const fetchTokenPrice = async () => {
+  const params = {
+    chainid: 1,
+    apikey: API_KEY,
+    module: 'token',
+    action: 'tokeninfo',
+    contractaddress: BZR_ADDRESS,
+  };
+
+  try {
+    const response = await axios.get(API_V2_BASE_URL, { params });
+    if (response.data?.status === '1' && Array.isArray(response.data.result) && response.data.result.length) {
+      const [tokenInfo] = response.data.result;
+      const numericPrice = Number(tokenInfo.tokenPriceUSD);
+      return {
+        available: true,
+        priceUsd: Number.isFinite(numericPrice) ? numericPrice : null,
+        priceUsdRaw: tokenInfo.tokenPriceUSD,
+        source: 'etherscan',
+        timestamp: Date.now(),
+        proRequired: false,
+      };
+    }
+
+    if (isProOnlyResponse(response.data)) {
+      return {
+        available: false,
+        priceUsd: null,
+        priceUsdRaw: null,
+        source: 'etherscan',
+        timestamp: Date.now(),
+        proRequired: true,
+        message: response.data?.result || response.data?.message || 'Pro endpoint required',
+      };
+    }
+
+    const errorMessage = response.data?.message || 'Unknown error fetching token price';
+    throw new Error(errorMessage);
+  } catch (error) {
+    if (error.response?.data && isProOnlyResponse(error.response.data)) {
+      return {
+        available: false,
+        priceUsd: null,
+        priceUsdRaw: null,
+        source: 'etherscan',
+        timestamp: Date.now(),
+        proRequired: true,
+        message: error.response.data.result || error.response.data.message || 'Pro endpoint required',
+      };
+    }
+
+    console.error('X Failed to fetch token price:', error.message || error);
+    throw error;
+  }
+};
+
+const fetchFinalizedBlock = async () => {
+  const params = {
+    chainid: 1,
+    apikey: API_KEY,
+    module: 'proxy',
+    action: 'eth_getBlockByNumber',
+    tag: 'finalized',
+    boolean: 'true',
+  };
+
+  try {
+    const response = await axios.get(API_V2_BASE_URL, { params });
+    const result = response.data?.result;
+
+    if (!result || typeof result.number !== 'string') {
+      throw new Error('Finalized block response missing number');
+    }
+
+    const blockNumberHex = result.number;
+    const blockNumber = Number.parseInt(blockNumberHex, 16);
+
+    return {
+      blockNumber,
+      blockNumberHex,
+      timestamp: Date.now(),
+      source: 'etherscan',
+    };
+  } catch (error) {
+    console.error('X Failed to fetch finalized block:', error.message || error);
+    throw error;
   }
 };
 
@@ -484,8 +593,58 @@ app.get('/api/cache-health', (req, res) => {
     transfers: withMeta(cache.transfers, cache.transfersTimestamp, TWO_MINUTES),
     transferChains: cache.transfersChainStatus,
     stats: withMeta(cache.stats, cache.statsTimestamp, TWO_MINUTES),
+    tokenPrice: {
+      ...withMeta(cache.tokenPrice, cache.tokenPriceTimestamp, TOKEN_PRICE_TTL_MS),
+      proRequired: cache.tokenPrice?.proRequired || false,
+      available: cache.tokenPrice?.available || false,
+      priceUsd: typeof cache.tokenPrice?.priceUsd === 'number' ? cache.tokenPrice.priceUsd : null,
+      priceUsdRaw: cache.tokenPrice?.priceUsdRaw ?? null,
+    },
+    finality: {
+      ...withMeta(cache.finality, cache.finalityTimestamp, FINALITY_TTL_MS),
+      blockNumber: cache.finality?.blockNumber ?? null,
+      blockNumberHex: cache.finality?.blockNumberHex ?? null,
+    },
     serverTime: new Date(now).toISOString(),
   });
+});
+
+app.get('/api/token-price', async (req, res) => {
+  const now = Date.now();
+  if (cache.tokenPrice && (now - cache.tokenPriceTimestamp) < TOKEN_PRICE_TTL_MS) {
+    return res.json(cache.tokenPrice);
+  }
+
+  try {
+    const payload = await fetchTokenPrice();
+    cache.tokenPrice = payload;
+    cache.tokenPriceTimestamp = payload.timestamp;
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({
+      message: 'Failed to fetch token price',
+      error: error.message || String(error),
+    });
+  }
+});
+
+app.get('/api/finality', async (req, res) => {
+  const now = Date.now();
+  if (cache.finality && (now - cache.finalityTimestamp) < FINALITY_TTL_MS) {
+    return res.json(cache.finality);
+  }
+
+  try {
+    const payload = await fetchFinalizedBlock();
+    cache.finality = payload;
+    cache.finalityTimestamp = payload.timestamp;
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({
+      message: 'Failed to fetch finalized block',
+      error: error.message || String(error),
+    });
+  }
 });
 
 // [Milestone 4.1] - Admin Panel
