@@ -60,6 +60,24 @@ const CACHE_WARM_INTERVAL_MS = Number(process.env.CACHE_WARM_INTERVAL_MS || 90_0
 const TOKEN_PRICE_TTL_MS = Number(process.env.TOKEN_PRICE_TTL_MS || 60_000);
 const FINALITY_TTL_MS = Number(process.env.FINALITY_TTL_MS || 30_000);
 const FINALITY_FALLBACK_RPC_URL = process.env.FINALITY_FALLBACK_RPC_URL || 'https://eth.llamarpc.com';
+const TOKEN_PRICE_FALLBACK_ENABLED = process.env.TOKEN_PRICE_FALLBACK_ENABLED !== 'false';
+const TOKEN_PRICE_FALLBACK_QUERY = process.env.TOKEN_PRICE_FALLBACK_QUERY || 'BZR';
+const TOKEN_PRICE_FALLBACK_SYMBOLS = (process.env.TOKEN_PRICE_FALLBACK_SYMBOLS || 'BZR')
+  .split(',')
+  .map((value) => value.trim().toUpperCase())
+  .filter(Boolean);
+const TOKEN_PRICE_FALLBACK_BASE_ADDRESSES = (process.env.TOKEN_PRICE_FALLBACK_BASE_ADDRESSES || '')
+  .split(',')
+  .map((value) => value.trim().toLowerCase())
+  .filter(Boolean);
+const TOKEN_PRICE_FALLBACK_CHAIN_IDS = (process.env.TOKEN_PRICE_FALLBACK_CHAIN_IDS || '')
+  .split(',')
+  .map((value) => value.trim().toLowerCase())
+  .filter(Boolean);
+const TOKEN_PRICE_FALLBACK_TIMEOUT_MS = Number(process.env.TOKEN_PRICE_FALLBACK_TIMEOUT_MS || 5_000);
+const TOKEN_PRICE_FALLBACK_SYMBOL_SET = new Set(TOKEN_PRICE_FALLBACK_SYMBOLS);
+const TOKEN_PRICE_FALLBACK_BASE_ADDRESS_SET = new Set(TOKEN_PRICE_FALLBACK_BASE_ADDRESSES);
+const TOKEN_PRICE_FALLBACK_CHAIN_ID_SET = new Set(TOKEN_PRICE_FALLBACK_CHAIN_IDS);
 
 const toNumericTimestamp = (timestamp) => {
   const parsed = Number(timestamp);
@@ -276,7 +294,7 @@ const fetchStatsForChain = async (chain) => {
   }
 };
 
-const fetchTokenPrice = async () => {
+const fetchTokenPriceFromEtherscan = async () => {
   const params = {
     chainid: 1,
     apikey: API_KEY,
@@ -329,6 +347,170 @@ const fetchTokenPrice = async () => {
 
     console.error('X Failed to fetch token price:', error.message || error);
     throw error;
+  }
+};
+
+const parsePositiveNumber = (value) => {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return null;
+  }
+
+  return numeric;
+};
+
+const fetchTokenPriceFromDexscreener = async () => {
+  if (!TOKEN_PRICE_FALLBACK_ENABLED) {
+    throw new Error('Token price fallback disabled');
+  }
+
+  const query = TOKEN_PRICE_FALLBACK_QUERY;
+  if (!query) {
+    throw new Error('Token price fallback query not configured');
+  }
+
+  const endpoint = `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(query)}`;
+
+  try {
+    const response = await axios.get(endpoint, {
+      timeout: TOKEN_PRICE_FALLBACK_TIMEOUT_MS,
+    });
+
+    const pairs = response.data?.pairs;
+
+    if (!Array.isArray(pairs) || pairs.length === 0) {
+      throw new Error('DexScreener returned no pairs');
+    }
+
+    const hasSymbolFilters = TOKEN_PRICE_FALLBACK_SYMBOL_SET.size > 0;
+    const hasAddressFilters = TOKEN_PRICE_FALLBACK_BASE_ADDRESS_SET.size > 0;
+    const hasChainFilters = TOKEN_PRICE_FALLBACK_CHAIN_ID_SET.size > 0;
+
+    let selectedPair = null;
+    let selectedLiquidity = 0;
+
+    pairs.forEach((pair) => {
+      const baseSymbol = String(pair?.baseToken?.symbol || '').toUpperCase();
+      const baseAddress = String(pair?.baseToken?.address || '').toLowerCase();
+      const chainId = String(pair?.chainId || '').toLowerCase();
+      const priceUsdRaw = pair?.priceUsd;
+      const priceUsd = parsePositiveNumber(priceUsdRaw);
+      const liquidityUsd = parsePositiveNumber(pair?.liquidity?.usd);
+
+      if (!priceUsd || priceUsd <= 0) {
+        return;
+      }
+
+      if (hasSymbolFilters && !TOKEN_PRICE_FALLBACK_SYMBOL_SET.has(baseSymbol)) {
+        return;
+      }
+
+      if (hasChainFilters && !TOKEN_PRICE_FALLBACK_CHAIN_ID_SET.has(chainId)) {
+        return;
+      }
+
+      if (hasAddressFilters && !TOKEN_PRICE_FALLBACK_BASE_ADDRESS_SET.has(baseAddress)) {
+        return;
+      }
+
+      const effectiveLiquidity = liquidityUsd && liquidityUsd > 0 ? liquidityUsd : 0;
+
+      if (!selectedPair || effectiveLiquidity > selectedLiquidity) {
+        selectedPair = {
+          pair,
+          priceUsd,
+          priceUsdRaw,
+          liquidityUsd: effectiveLiquidity,
+        };
+        selectedLiquidity = effectiveLiquidity;
+      }
+    });
+
+    if (!selectedPair) {
+      throw new Error('DexScreener fallback found no usable pairs');
+    }
+
+    const {
+      pair,
+      priceUsd,
+      priceUsdRaw,
+      liquidityUsd,
+    } = selectedPair;
+
+    const liquidityDescriptor = liquidityUsd > 0
+      ? `liq ~$${liquidityUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })}`
+      : 'liquidity unavailable';
+
+    return {
+      available: true,
+      priceUsd,
+      priceUsdRaw: typeof priceUsdRaw === 'string' ? priceUsdRaw : String(priceUsd),
+      source: `dexscreener:${pair.chainId}:${pair.pairAddress}`,
+      timestamp: Date.now(),
+      proRequired: false,
+      message: `DexScreener ${pair.dexId} pair ${pair.baseToken?.symbol}/${pair.quoteToken?.symbol} (${liquidityDescriptor})`,
+    };
+  } catch (error) {
+    if (error.response?.data) {
+      throw new Error(`DexScreener error: ${JSON.stringify(error.response.data)}`);
+    }
+
+    throw error;
+  }
+};
+
+const fetchTokenPrice = async () => {
+  let primaryPayload = null;
+  let primaryError = null;
+
+  try {
+    primaryPayload = await fetchTokenPriceFromEtherscan();
+
+    if (
+      primaryPayload.available &&
+      typeof primaryPayload.priceUsd === 'number' &&
+      primaryPayload.priceUsd > 0
+    ) {
+      return primaryPayload;
+    }
+
+    const reason = primaryPayload.proRequired
+      ? (primaryPayload.message || 'Etherscan PRO plan required for token price')
+      : 'Etherscan returned no price data';
+    primaryError = new Error(reason);
+  } catch (error) {
+    primaryError = error;
+  }
+
+  try {
+    const fallbackPayload = await fetchTokenPriceFromDexscreener();
+    if (primaryError) {
+      fallbackPayload.message = [fallbackPayload.message, `Etherscan fallback: ${primaryError.message || primaryError}`]
+        .filter(Boolean)
+        .join(' · ');
+    }
+    return fallbackPayload;
+  } catch (fallbackError) {
+    if (primaryPayload) {
+      return {
+        ...primaryPayload,
+        available: primaryPayload.available && typeof primaryPayload.priceUsd === 'number' && primaryPayload.priceUsd > 0,
+        message: [primaryPayload.message, `Fallback failed: ${fallbackError.message || fallbackError}`]
+          .filter(Boolean)
+          .join(' · '),
+      };
+    }
+
+    if (primaryError) {
+      const aggregate = new Error('Unable to fetch token price from Etherscan and fallback provider');
+      aggregate.cause = {
+        primaryError: primaryError.message || primaryError,
+        fallbackError: fallbackError.message || fallbackError,
+      };
+      throw aggregate;
+    }
+
+    throw fallbackError;
   }
 };
 
