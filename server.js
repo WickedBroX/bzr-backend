@@ -13,25 +13,136 @@ app.use(cors());
 app.use(express.json());
 
 // --- Constants ---
-const API_KEY = process.env.ETHERSCAN_V2_API_KEY;
+const ETHERSCAN_API_KEY = process.env.ETHERSCAN_V2_API_KEY;
 const BZR_ADDRESS = process.env.BZR_TOKEN_ADDRESS;
 const API_V2_BASE_URL = 'https://api.etherscan.io/v2/api';
+const CRONOS_API_KEY = process.env.CRONOS_API_KEY;
+const CRONOS_API_BASE_URL = process.env.CRONOS_API_BASE_URL || 'https://explorer-api.cronos.org/mainnet/api/v2';
 const MAX_CONCURRENT_REQUESTS = Number(process.env.ETHERSCAN_CONCURRENCY || 3);
+
+const PROVIDERS = {
+  etherscan: {
+    apiKey: ETHERSCAN_API_KEY,
+    baseUrl: API_V2_BASE_URL,
+    requiresChainId: true,
+  },
+  cronos: {
+    apiKey: CRONOS_API_KEY,
+    baseUrl: CRONOS_API_BASE_URL,
+    requiresChainId: false,
+  },
+};
+
 console.log(`i API Base URL: ${API_V2_BASE_URL}`);
+console.log(`i Cronos API Base URL: ${CRONOS_API_BASE_URL}`);
 
 // [Milestone 2.2] Define all 10 chains
 const CHAINS = [
-  { id: 1, name: 'Ethereum' },
-  { id: 10, name: 'Optimism' },
-  { id: 56, name: 'BSC' },
-  { id: 137, name: 'Polygon' },
-  { id: 324, name: 'zkSync' },
-  { id: 5000, name: 'Mantle' },
-  { id: 42161, name: 'Arbitrum' },
-  { id: 43114, name: 'Avalanche' },
-  { id: 8453, name: 'Base' },
-  { id: 25, name: 'Cronos' }, // Note: Etherscan V2 list has Cronos as 25
+  { id: 1, name: 'Ethereum', provider: 'etherscan' },
+  { id: 10, name: 'Optimism', provider: 'etherscan' },
+  { id: 56, name: 'BSC', provider: 'etherscan' },
+  { id: 137, name: 'Polygon', provider: 'etherscan' },
+  { id: 324, name: 'zkSync', provider: 'etherscan' },
+  { id: 5000, name: 'Mantle', provider: 'etherscan' },
+  { id: 42161, name: 'Arbitrum', provider: 'etherscan' },
+  { id: 43114, name: 'Avalanche', provider: 'etherscan' },
+  { id: 8453, name: 'Base', provider: 'etherscan' },
+  { id: 25, name: 'Cronos', provider: 'cronos' },
 ];
+
+const DEFAULT_PROVIDER_KEY = 'etherscan';
+
+const getProviderKeyForChain = (chain) => (chain?.provider ? String(chain.provider) : DEFAULT_PROVIDER_KEY);
+
+const getProviderConfigForChain = (chain, { requireApiKey = true } = {}) => {
+  const providerKey = getProviderKeyForChain(chain);
+  const provider = PROVIDERS[providerKey];
+
+  if (!provider) {
+    throw new Error(`Provider configuration missing for chain ${chain?.name || chain?.id} (${providerKey})`);
+  }
+
+  if (requireApiKey && !provider.apiKey) {
+    throw new Error(`Missing API key for provider "${providerKey}" (chain ${chain?.name || chain?.id})`);
+  }
+
+  return { ...provider, key: providerKey };
+};
+
+const buildProviderRequest = (chain, params = {}, options = {}) => {
+  const { includeApiKey = true } = options;
+  const provider = getProviderConfigForChain(chain, { requireApiKey: includeApiKey });
+  const nextParams = { ...params };
+
+  if (includeApiKey) {
+    nextParams.apikey = provider.apiKey;
+  }
+
+  if (provider.requiresChainId) {
+    nextParams.chainid = chain.id;
+  }
+
+  return {
+    provider,
+    params: nextParams,
+  };
+};
+
+const isCronosChain = (chain) => getProviderKeyForChain(chain) === 'cronos';
+
+const HEX_PREFIX = /^0x/i;
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+const TRANSFER_EVENT_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const CRONOS_MAX_LOG_BLOCK_RANGE = Number(process.env.CRONOS_LOG_BLOCK_RANGE || 9_999);
+const CRONOS_MAX_LOG_ITERATIONS = Number(process.env.CRONOS_LOG_MAX_ITERATIONS || 12);
+const CRONOS_TOTAL_MAX_ITERATIONS = Number(process.env.CRONOS_TOTAL_LOG_MAX_ITERATIONS || 60);
+const BZR_TOKEN_NAME = process.env.BZR_TOKEN_NAME || 'Bazaars';
+const BZR_TOKEN_SYMBOL = process.env.BZR_TOKEN_SYMBOL || 'BZR';
+const BZR_TOKEN_DECIMALS = Number(process.env.BZR_TOKEN_DECIMALS || 18);
+
+const normalizeHex = (value) => {
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      return '0x0';
+    }
+    return `0x${value.toString(16)}`;
+  }
+
+  if (typeof value === 'bigint') {
+    return `0x${value.toString(16)}`;
+  }
+
+  if (typeof value === 'string') {
+    return HEX_PREFIX.test(value) ? value : `0x${value}`;
+  }
+
+  return '0x0';
+};
+
+const hexToBigInt = (value) => {
+  try {
+    return BigInt(normalizeHex(value));
+  } catch (error) {
+    return BigInt(0);
+  }
+};
+
+const hexToDecimalString = (value) => hexToBigInt(value).toString(10);
+
+const hexToNumberSafe = (value) => {
+  const normalized = normalizeHex(value);
+  const parsed = Number.parseInt(normalized, 16);
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const topicToAddress = (topic) => {
+  if (typeof topic !== 'string' || topic.length < 42) {
+    return ZERO_ADDRESS;
+  }
+
+  const trimmed = topic.slice(-40);
+  return `0x${trimmed.toLowerCase()}`;
+};
 
 // --- Helper Functions ---
 /**
@@ -213,9 +324,11 @@ const sanitizeTransfers = (transfers, chain) => {
 };
 
 const respondUpstreamFailure = (res, message, details = {}) => {
+  const upstreamProvider = details?.upstreamProvider || details?.provider || 'etherscan';
+
   return res.status(502).json({
     message,
-    upstream: 'etherscan',
+    upstream: upstreamProvider,
     ...details,
   });
 };
@@ -261,6 +374,260 @@ const mapWithConcurrency = async (items, limit, task) => {
 
   await Promise.all(Array.from({ length: workerCount }, worker));
   return results;
+};
+
+const fetchLatestBlockNumberForChain = async (chain) => {
+  const { provider, params } = buildProviderRequest(chain, {
+    module: 'proxy',
+    action: 'eth_blockNumber',
+  });
+
+  try {
+    const response = await axios.get(provider.baseUrl, { params });
+    const payload = response?.data || {};
+    if (typeof payload.result === 'string') {
+      return hexToNumberSafe(payload.result);
+    }
+
+    const error = new Error(payload?.message || 'Invalid block number payload');
+    error.code = 'PROXY_BLOCKNUMBER_INVALID';
+    error.payload = payload;
+    throw error;
+  } catch (error) {
+    if (error.response?.data) {
+      const wrapped = new Error(error.message || 'Failed to fetch latest block number');
+      wrapped.code = 'PROXY_BLOCKNUMBER_HTTP_ERROR';
+      wrapped.payload = error.response.data;
+      throw wrapped;
+    }
+
+    throw error;
+  }
+};
+
+const mapCronosLogToTransfer = (log, chain, latestBlockNumber) => {
+  const blockNumber = hexToNumberSafe(log.blockNumber);
+  const timeStamp = hexToNumberSafe(log.timeStamp);
+  const transactionIndex = hexToNumberSafe(log.transactionIndex);
+  const logIndex = hexToNumberSafe(log.logIndex);
+  const gasUsed = hexToDecimalString(log.gasUsed || '0x0');
+  const gasPrice = hexToDecimalString(log.gasPrice || '0x0');
+  const confirmations = latestBlockNumber >= blockNumber
+    ? String(Math.max(0, latestBlockNumber - blockNumber))
+    : '0';
+
+  return {
+    blockNumber: String(blockNumber),
+    timeStamp: String(timeStamp),
+    hash: log.transactionHash,
+    nonce: '0',
+    blockHash: log.blockHash,
+    from: topicToAddress(log.topics?.[1]),
+    contractAddress: log.address,
+    to: topicToAddress(log.topics?.[2]),
+    value: hexToDecimalString(log.data || '0x0'),
+    tokenName: BZR_TOKEN_NAME,
+    tokenSymbol: BZR_TOKEN_SYMBOL,
+    tokenDecimal: String(BZR_TOKEN_DECIMALS),
+    transactionIndex: String(transactionIndex),
+    gas: gasUsed,
+    gasPrice,
+    gasUsed,
+    cumulativeGasUsed: gasUsed,
+    input: '0x',
+    methodId: '0x',
+    functionName: 'Transfer(address,address,uint256)',
+    confirmations,
+    logIndex: String(logIndex),
+  };
+};
+
+const fetchCronosLogsWindow = async (chain, fromBlock, toBlock) => {
+  const { provider, params } = buildProviderRequest(chain, {
+    module: 'logs',
+    action: 'getLogs',
+    fromBlock,
+    toBlock,
+    address: BZR_ADDRESS,
+    topic0: TRANSFER_EVENT_TOPIC,
+  });
+
+  const response = await axios.get(provider.baseUrl, { params });
+  const payload = response?.data || {};
+
+  return {
+    payload,
+    request: {
+      fromBlock,
+      toBlock,
+    },
+  };
+};
+
+const fetchCronosTransfersPage = async ({
+  chain,
+  page,
+  pageSize,
+  sort,
+  startBlock,
+  endBlock,
+}) => {
+  const normalizedPage = normalizePageNumber(page);
+  const normalizedPageSize = clampTransfersPageSize(pageSize);
+  const latestBlockNumber = await fetchLatestBlockNumberForChain(chain);
+  const effectiveEnd = typeof endBlock === 'number' ? endBlock : latestBlockNumber;
+  const effectiveStart = typeof startBlock === 'number' ? startBlock : 0;
+
+  let currentTo = effectiveEnd;
+  let iterations = 0;
+  const collected = [];
+  const batches = [];
+  const requiredItems = normalizedPage * normalizedPageSize + normalizedPageSize;
+
+  while (
+    currentTo >= effectiveStart &&
+    iterations < CRONOS_MAX_LOG_ITERATIONS &&
+    collected.length < requiredItems
+  ) {
+    const span = CRONOS_MAX_LOG_BLOCK_RANGE > 0 ? CRONOS_MAX_LOG_BLOCK_RANGE : 9_999;
+    const currentFrom = Math.max(effectiveStart, currentTo - (span - 1));
+    const { payload, request } = await fetchCronosLogsWindow(chain, currentFrom, currentTo);
+    const resultLength = Array.isArray(payload.result) ? payload.result.length : 0;
+
+    batches.push({
+      ...request,
+      status: payload.status,
+      message: payload.message,
+      resultLength,
+    });
+
+    if (payload.status === '1' && Array.isArray(payload.result)) {
+      collected.push(...payload.result);
+    } else if (payload.status === '0') {
+      const message = String(payload.message || payload.result || '').toLowerCase();
+      if (!(message.includes('no records') || message.includes('no logs'))) {
+        const error = new Error(payload.message || payload.result || 'Failed to fetch Cronos token transfers');
+        error.code = 'CRONOS_LOGS_ERROR';
+        error.payload = payload;
+        throw error;
+      }
+    } else {
+      const error = new Error('Unexpected response from Cronos logs endpoint');
+      error.code = 'CRONOS_LOGS_UNEXPECTED_RESPONSE';
+      error.payload = payload;
+      throw error;
+    }
+
+    iterations += 1;
+    currentTo = currentFrom - 1;
+  }
+
+  const decorated = collected.map((log) => ({
+    log,
+    blockNumber: hexToNumberSafe(log.blockNumber),
+    timeStamp: hexToNumberSafe(log.timeStamp),
+  }));
+
+  decorated.sort((a, b) => {
+    const comparator = sort === 'asc' ? 1 : -1;
+    if (a.blockNumber !== b.blockNumber) {
+      return comparator * (a.blockNumber - b.blockNumber);
+    }
+
+    return comparator * (a.timeStamp - b.timeStamp);
+  });
+
+  const startIndex = (normalizedPage - 1) * normalizedPageSize;
+  const pageLogs = decorated.slice(startIndex, startIndex + normalizedPageSize).map((entry) => entry.log);
+  const mapped = pageLogs.map((log) => mapCronosLogToTransfer(log, chain, latestBlockNumber));
+  const transfers = sanitizeTransfers(mapped, chain);
+
+  return {
+    transfers,
+    upstream: {
+      provider: 'cronos',
+      latestBlock: latestBlockNumber,
+      iterations,
+      batches,
+      collected: collected.length,
+    },
+    timestamp: Date.now(),
+    page: normalizedPage,
+    pageSize: normalizedPageSize,
+    sort,
+    startBlock,
+    endBlock,
+    resultLength: transfers.length,
+    totalCollected: decorated.length,
+  };
+};
+
+const fetchCronosTransfersTotalCount = async ({ chain, startBlock, endBlock }) => {
+  const latestBlockNumber = await fetchLatestBlockNumberForChain(chain);
+  const effectiveEnd = typeof endBlock === 'number' ? endBlock : latestBlockNumber;
+  const effectiveStart = typeof startBlock === 'number' ? startBlock : 0;
+
+  let currentTo = effectiveEnd;
+  let iterations = 0;
+  let total = 0;
+  let truncated = false;
+  const batches = [];
+
+  while (currentTo >= effectiveStart && iterations < CRONOS_TOTAL_MAX_ITERATIONS) {
+    const span = CRONOS_MAX_LOG_BLOCK_RANGE > 0 ? CRONOS_MAX_LOG_BLOCK_RANGE : 9_999;
+    const currentFrom = Math.max(effectiveStart, currentTo - (span - 1));
+    const { payload, request } = await fetchCronosLogsWindow(chain, currentFrom, currentTo);
+    const resultLength = Array.isArray(payload.result) ? payload.result.length : 0;
+
+    batches.push({
+      ...request,
+      status: payload.status,
+      message: payload.message,
+      resultLength,
+    });
+
+    if (payload.status === '1' && Array.isArray(payload.result)) {
+      total += resultLength;
+      if (total >= TRANSFERS_TOTAL_FETCH_LIMIT) {
+        truncated = true;
+        total = TRANSFERS_TOTAL_FETCH_LIMIT;
+        break;
+      }
+    } else if (payload.status === '0') {
+      const message = String(payload.message || payload.result || '').toLowerCase();
+      if (!(message.includes('no records') || message.includes('no logs'))) {
+        const error = new Error(payload.message || payload.result || 'Failed to fetch Cronos transfers total');
+        error.code = 'CRONOS_LOGS_TOTAL_ERROR';
+        error.payload = payload;
+        throw error;
+      }
+    } else {
+      const error = new Error('Unexpected response from Cronos logs endpoint while counting');
+      error.code = 'CRONOS_LOGS_TOTAL_UNEXPECTED_RESPONSE';
+      error.payload = payload;
+      throw error;
+    }
+
+    iterations += 1;
+    currentTo = currentFrom - 1;
+  }
+
+  if (currentTo >= effectiveStart) {
+    truncated = true;
+  }
+
+  return {
+    total,
+    truncated,
+    timestamp: Date.now(),
+    resultLength: total,
+    upstream: {
+      provider: 'cronos',
+      iterations,
+      batches,
+      latestBlock: latestBlockNumber,
+    },
+  };
 };
 
 let transfersRefreshPromise = null;
@@ -372,9 +739,18 @@ const triggerTransfersRefresh = ({ forceRefresh = false } = {}) => {
  * @returns {Promise<Array>} A promise that resolves to an array of transactions.
  */
 const fetchTransfersPageFromChain = async ({ chain, page, pageSize, sort, startBlock, endBlock }) => {
-  const params = {
-    chainid: chain.id,
-    apikey: API_KEY,
+  if (isCronosChain(chain)) {
+    return fetchCronosTransfersPage({
+      chain,
+      page,
+      pageSize,
+      sort,
+      startBlock,
+      endBlock,
+    });
+  }
+
+  const baseParams = {
     module: 'account',
     action: 'tokentx',
     contractaddress: BZR_ADDRESS,
@@ -384,14 +760,16 @@ const fetchTransfersPageFromChain = async ({ chain, page, pageSize, sort, startB
   };
 
   if (typeof startBlock === 'number') {
-    params.startblock = startBlock;
+    baseParams.startblock = startBlock;
   }
   if (typeof endBlock === 'number') {
-    params.endblock = endBlock;
+    baseParams.endblock = endBlock;
   }
 
+  const { provider, params } = buildProviderRequest(chain, baseParams);
+
   try {
-    const response = await axios.get(API_V2_BASE_URL, { params });
+    const response = await axios.get(provider.baseUrl, { params });
     const payload = response?.data || {};
 
     if (payload.status === '1' && Array.isArray(payload.result)) {
@@ -455,9 +833,15 @@ const fetchTransfersPageFromChain = async ({ chain, page, pageSize, sort, startB
 };
 
 const fetchTransfersTotalCount = async ({ chain, sort, startBlock, endBlock }) => {
-  const params = {
-    chainid: chain.id,
-    apikey: API_KEY,
+  if (isCronosChain(chain)) {
+    return fetchCronosTransfersTotalCount({
+      chain,
+      startBlock,
+      endBlock,
+    });
+  }
+
+  const baseParams = {
     module: 'account',
     action: 'tokentx',
     contractaddress: BZR_ADDRESS,
@@ -467,14 +851,16 @@ const fetchTransfersTotalCount = async ({ chain, sort, startBlock, endBlock }) =
   };
 
   if (typeof startBlock === 'number') {
-    params.startblock = startBlock;
+    baseParams.startblock = startBlock;
   }
   if (typeof endBlock === 'number') {
-    params.endblock = endBlock;
+    baseParams.endblock = endBlock;
   }
 
+  const { provider, params } = buildProviderRequest(chain, baseParams);
+
   try {
-    const response = await axios.get(API_V2_BASE_URL, { params });
+    const response = await axios.get(provider.baseUrl, { params });
     const payload = response?.data || {};
 
     if (payload.status === '1') {
@@ -729,16 +1115,19 @@ const resolveTransfersTotalData = async ({
  * @returns {Promise<object>} A promise that resolves to a stats object.
  */
 const fetchStatsForChain = async (chain) => {
-  const params = {
-    chainid: chain.id,
-    apikey: API_KEY,
+  if (isCronosChain(chain)) {
+    console.warn('! Cronos tokenholdercount endpoint unavailable – defaulting to 0');
+    return { chainName: chain.name, chainId: chain.id, holderCount: 0, unsupported: true };
+  }
+
+  const { provider, params } = buildProviderRequest(chain, {
     module: 'token',
     action: 'tokenholdercount',
     contractaddress: BZR_ADDRESS,
-  };
+  });
 
   try {
-    const response = await axios.get(API_V2_BASE_URL, { params });
+    const response = await axios.get(provider.baseUrl, { params });
     if (response.data.status === '1') {
       return {
         chainName: chain.name,
@@ -759,7 +1148,7 @@ const fetchStatsForChain = async (chain) => {
 const fetchTokenPriceFromEtherscan = async () => {
   const params = {
     chainid: 1,
-    apikey: API_KEY,
+    apikey: ETHERSCAN_API_KEY,
     module: 'token',
     action: 'tokeninfo',
     contractaddress: BZR_ADDRESS,
@@ -999,7 +1388,7 @@ const parseFinalizedBlockPayload = (result, source) => {
 const fetchFinalizedBlockFromEtherscan = async () => {
   const params = {
     chainid: 1,
-    apikey: API_KEY,
+    apikey: ETHERSCAN_API_KEY,
     module: 'proxy',
     action: 'eth_getBlockByNumber',
     tag: 'finalized',
@@ -1089,14 +1478,14 @@ app.get('/api/info', async (req, res) => {
     return res.json(cache.info);
   }
 
-  if (!API_KEY || !BZR_ADDRESS) {
-    return res.status(500).json({ message: 'Server is missing API_KEY or BZR_ADDRESS' });
+  if (!ETHERSCAN_API_KEY || !BZR_ADDRESS) {
+    return res.status(500).json({ message: 'Server is missing ETHERSCAN_V2_API_KEY or BZR_TOKEN_ADDRESS' });
   }
 
   // We only need to get this info from one chain, so we'll use Ethereum (chainid=1)
   const params = {
     chainid: 1, // Ethereum Mainnet
-    apikey: API_KEY,
+    apikey: ETHERSCAN_API_KEY,
   };
 
   // We will make two API calls in parallel to get all the info we need
@@ -1184,8 +1573,8 @@ app.get('/api/info', async (req, res) => {
 app.get('/api/transfers', async (req, res) => {
   console.log(`[${new Date().toISOString()}] Received request for /api/transfers`);
 
-  if (!API_KEY || !BZR_ADDRESS) {
-    return res.status(500).json({ message: 'Server missing ETHERSCAN_V2_API_KEY or BZR_TOKEN_ADDRESS' });
+  if (!BZR_ADDRESS) {
+    return res.status(500).json({ message: 'Server missing BZR_TOKEN_ADDRESS' });
   }
 
   const forceRefresh = String(req.query.force).toLowerCase() === 'true';
@@ -1213,6 +1602,12 @@ app.get('/api/transfers', async (req, res) => {
       chainId: requestedChainId,
       availableChains: CHAINS,
     });
+  }
+
+  try {
+    getProviderConfigForChain(chain);
+  } catch (providerError) {
+    return res.status(500).json({ message: providerError.message });
   }
 
   try {
@@ -1316,6 +1711,9 @@ app.get('/api/transfers', async (req, res) => {
   } catch (error) {
     console.error('Error handling /api/transfers request:', error.message || error);
 
+    const providerKey = getProviderKeyForChain(chain);
+    const providerLabel = providerKey === 'cronos' ? 'Cronos explorer' : 'Etherscan';
+
     if (error.code === 'ETHERSCAN_PRO_ONLY') {
       return res.status(402).json({
         message: 'Etherscan PRO plan required for this request',
@@ -1324,14 +1722,15 @@ app.get('/api/transfers', async (req, res) => {
     }
 
     if (error.code && error.payload) {
-      return respondUpstreamFailure(res, 'Failed to fetch transfers from Etherscan', {
+      return respondUpstreamFailure(res, `Failed to fetch transfers from ${providerLabel}`, {
+        upstreamProvider: providerKey,
         errorCode: error.code,
         upstreamResponse: error.payload,
       });
     }
 
     return res.status(500).json({
-      message: 'Failed to fetch transfers',
+      message: `Failed to fetch transfers from ${providerLabel}`,
       error: error.message || String(error),
     });
   }
@@ -1482,13 +1881,22 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
   console.log(`BZR Backend server listening on http://localhost:${PORT}`);
   
-  if (!API_KEY) {
+  if (!ETHERSCAN_API_KEY) {
     console.warn('---');
     console.warn('WARNING: ETHERSCAN_V2_API_KEY is not set in your .env file.');
     console.warn('The API calls will fail until this is set.');
     console.warn('---');
   } else {
     console.log('Etherscan API key loaded successfully.');
+  }
+
+  if (!CRONOS_API_KEY) {
+    console.warn('---');
+    console.warn('WARNING: CRONOS_API_KEY is not set in your .env file.');
+    console.warn('Cronos chain requests will fail until this is configured.');
+    console.warn('---');
+  } else {
+    console.log('Cronos API key loaded successfully.');
   }
 
   if (!BZR_ADDRESS) {
