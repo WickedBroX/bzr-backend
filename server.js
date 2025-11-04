@@ -2278,6 +2278,88 @@ app.get('/api/stats', async (req, res) => {
   }
 });
 
+// [Phase 2.1] - Token Holders List
+app.get('/api/holders', async (req, res) => {
+  console.log(`[${new Date().toISOString()}] Received request for /api/holders`);
+  
+  if (!BZR_ADDRESS) {
+    return res.status(500).json({ message: 'Server missing BZR_TOKEN_ADDRESS' });
+  }
+
+  const requestedChainId = Number(req.query.chainId || 1); // Default to Ethereum
+  const page = Math.max(1, Number(req.query.page || 1));
+  const pageSize = Math.min(100, Math.max(10, Number(req.query.pageSize || 50))); // 10-100, default 50
+  
+  const chain = getChainDefinition(requestedChainId);
+  if (!chain) {
+    return res.status(400).json({
+      message: 'Invalid chain ID',
+      chainId: requestedChainId,
+      availableChains: CHAINS,
+    });
+  }
+
+  // Cronos doesn't support tokenholderlist
+  if (isCronosChain(chain)) {
+    return res.status(501).json({
+      message: 'Cronos chain does not support token holder list',
+      chainId: requestedChainId,
+      chainName: chain.name,
+    });
+  }
+
+  try {
+    const provider = getProviderConfigForChain(chain);
+    const response = await axios.get(provider.baseUrl, {
+      params: {
+        chainid: chain.id,
+        apikey: provider.apiKey,
+        module: 'token',
+        action: 'tokenholderlist',
+        contractaddress: BZR_ADDRESS,
+        page,
+        offset: pageSize,
+      },
+      timeout: 30000,
+    });
+
+    if (response.data.status !== '1') {
+      console.error(`X Etherscan tokenholderlist error for ${chain.name}:`, response.data.message);
+      return res.status(502).json({
+        message: response.data.message || 'Failed to fetch holders from Etherscan',
+        chainId: chain.id,
+        chainName: chain.name,
+      });
+    }
+
+    const holders = Array.isArray(response.data.result) ? response.data.result : [];
+    
+    console.log(`-> Fetched ${holders.length} holders for ${chain.name} (page ${page})`);
+    
+    res.json({
+      data: holders,
+      chain: {
+        id: chain.id,
+        name: chain.name,
+      },
+      pagination: {
+        page,
+        pageSize,
+        resultCount: holders.length,
+      },
+      timestamp: Date.now(),
+    });
+  } catch (error) {
+    console.error(`Error fetching holders for ${chain.name}:`, error.message);
+    if (error.response?.data) {
+      return respondUpstreamFailure(res, 'Failed to fetch token holders from Etherscan', {
+        upstreamResponse: error.response.data,
+      });
+    }
+    res.status(500).json({ message: 'Failed to fetch holders', error: error.message });
+  }
+});
+
 app.get('/api/cache-health', (req, res) => {
   const now = Date.now();
 
