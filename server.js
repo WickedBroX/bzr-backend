@@ -654,9 +654,11 @@ const warmTransfersCacheForChain = async (chain, { forceRefresh = false, pageSiz
     errorCode: null,
     warmed: false,
     totalsWarmed: false,
+    totalsWarning: null,
   };
 
   try {
+    // Always warm the page cache first
     await resolveTransfersPageData({
       chain,
       page: 1,
@@ -668,15 +670,25 @@ const warmTransfersCacheForChain = async (chain, { forceRefresh = false, pageSiz
     });
     summary.warmed = true;
 
-    await resolveTransfersTotalData({
-      chain,
-      sort: 'desc',
-      startBlock: undefined,
-      endBlock: undefined,
-      forceRefresh,
-    });
-    summary.totalsWarmed = true;
+    // Try to warm totals, but don't fail if it errors
+    try {
+      await resolveTransfersTotalData({
+        chain,
+        sort: 'desc',
+        startBlock: undefined,
+        endBlock: undefined,
+        forceRefresh,
+      });
+      summary.totalsWarmed = true;
+    } catch (totalsError) {
+      // Log but don't fail - totals are nice to have but not critical
+      console.warn(`! Could not warm totals for ${chain.name}: ${totalsError.message || totalsError}`);
+      summary.totalsWarning = totalsError.message || String(totalsError);
+      summary.totalsErrorCode = totalsError.code || null;
+      // Still mark status as 'ok' since page warming succeeded
+    }
   } catch (error) {
+    // Only mark as error if page warming failed
     summary.status = 'error';
     summary.error = error.message || String(error);
     summary.errorCode = error.code || null;
@@ -1011,12 +1023,16 @@ const fetchTransfersTotalCount = async ({ chain, sort, startBlock, endBlock }) =
     });
   }
 
+  // [Master-level fix] Respect Etherscan window limit (pageNo × offset ≤ 10,000)
+  // Use maximum safe offset to get best total estimate
+  const safeOffset = ETHERSCAN_RESULT_WINDOW; // 10,000 is the max we can request
+
   const baseParams = {
     module: 'account',
     action: 'tokentx',
     contractaddress: BZR_ADDRESS,
     page: 1,
-    offset: TRANSFERS_TOTAL_FETCH_LIMIT,
+    offset: safeOffset,
     sort,
   };
 
@@ -1038,15 +1054,24 @@ const fetchTransfersTotalCount = async ({ chain, sort, startBlock, endBlock }) =
       const hasNumericCount = Number.isSafeInteger(numericCount) && numericCount >= 0;
       const resultLength = Array.isArray(payload.result) ? payload.result.length : 0;
       const total = hasNumericCount ? numericCount : resultLength;
+      
+      // If we got exactly 10k results, there are likely more
+      const windowCapped = resultLength >= safeOffset;
       const truncated = hasNumericCount
-        ? numericCount > TRANSFERS_TOTAL_FETCH_LIMIT
-        : resultLength === TRANSFERS_TOTAL_FETCH_LIMIT;
+        ? numericCount > safeOffset
+        : windowCapped;
+
+      if (windowCapped) {
+        console.warn(`! Chain ${chain.name} has more than ${safeOffset} transfers. Total count may be underestimated.`);
+      }
 
       return {
         total,
         truncated,
+        windowCapped,
         timestamp: Date.now(),
         resultLength,
+        maxSafeOffset: safeOffset,
       };
     }
 
@@ -1065,12 +1090,31 @@ const fetchTransfersTotalCount = async ({ chain, sort, startBlock, endBlock }) =
       }
 
       const noRecordsMessage = String(payload?.message || payload?.result || '').toLowerCase();
-      if (noRecordsMessage.includes('no transactions')) {
+      if (noRecordsMessage.includes('no transactions') || noRecordsMessage.includes('no records')) {
         return {
           total: 0,
           truncated: false,
+          windowCapped: false,
           timestamp: Date.now(),
           resultLength: 0,
+        };
+      }
+
+      // Check if it's the result window error
+      const windowErrorKeywords = ['result window', 'too large', 'must be less than'];
+      const isWindowError = windowErrorKeywords.some(keyword => 
+        errorString.toLowerCase().includes(keyword)
+      );
+
+      if (isWindowError) {
+        console.warn(`! Chain ${chain.name} exceeded result window. Returning estimated total.`);
+        return {
+          total: safeOffset,
+          truncated: true,
+          windowCapped: true,
+          timestamp: Date.now(),
+          resultLength: safeOffset,
+          error: 'RESULT_WINDOW_EXCEEDED',
         };
       }
 
@@ -1950,6 +1994,16 @@ app.get('/api/transfers', async (req, res) => {
     let totalsData = null;
     if (totalsOutcome.status === 'fulfilled') {
       totalsData = totalsOutcome.value;
+      
+      // Add warning if totals are window-capped
+      if (totalsData?.windowCapped) {
+        warnings.push({
+          scope: 'total',
+          code: 'TOTAL_COUNT_CAPPED',
+          message: `This chain has more than ${totalsData.maxSafeOffset || ETHERSCAN_RESULT_WINDOW} transfers. Total count may be underestimated due to Etherscan result window limits.`,
+          retryable: false,
+        });
+      }
     } else if (includeTotals) {
       const reason = totalsOutcome.reason || {};
       console.warn(`! Failed to refresh transfer totals for ${chain.name}: ${reason.message || reason}`);
