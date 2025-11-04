@@ -575,6 +575,27 @@ const fetchCronosTransfersTotalCount = async ({ chain, startBlock, endBlock }) =
   const effectiveEnd = typeof endBlock === 'number' ? endBlock : latestBlockNumber;
   const effectiveStart = typeof startBlock === 'number' ? startBlock : 0;
 
+  // [OPTIMIZATION] For all-time queries (no specific block range), return early
+  // to avoid timeout from iterating through entire blockchain history
+  const isAllTimeQuery = typeof startBlock !== 'number' && typeof endBlock !== 'number';
+  if (isAllTimeQuery) {
+    console.log(`[Cronos] Skipping expensive all-time total count to prevent timeout`);
+    return {
+      total: TRANSFERS_TOTAL_FETCH_LIMIT,
+      truncated: true,
+      timestamp: Date.now(),
+      resultLength: TRANSFERS_TOTAL_FETCH_LIMIT,
+      estimated: true,
+      upstream: {
+        provider: 'cronos',
+        iterations: 0,
+        batches: [],
+        latestBlock: latestBlockNumber,
+        note: 'All-time count estimation to prevent timeout',
+      },
+    };
+  }
+
   let currentTo = effectiveEnd;
   let iterations = 0;
   let total = 0;
