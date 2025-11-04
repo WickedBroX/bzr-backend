@@ -42,9 +42,10 @@ const CHAINS = [
 const cache = {
   info: null,
   infoTimestamp: 0,
-  transfers: null,
-  transfersTimestamp: 0,
-  transfersChainStatus: [],
+  transfersWarmStatus: [],
+  transfersWarmTimestamp: 0,
+  transfersPageCache: new Map(),
+  transfersTotalCache: new Map(),
   stats: null, // [Milestone 2.3] Cache for stats
   statsTimestamp: 0,
   tokenPrice: null,
@@ -78,10 +79,137 @@ const TOKEN_PRICE_FALLBACK_TIMEOUT_MS = Number(process.env.TOKEN_PRICE_FALLBACK_
 const TOKEN_PRICE_FALLBACK_SYMBOL_SET = new Set(TOKEN_PRICE_FALLBACK_SYMBOLS);
 const TOKEN_PRICE_FALLBACK_BASE_ADDRESS_SET = new Set(TOKEN_PRICE_FALLBACK_BASE_ADDRESSES);
 const TOKEN_PRICE_FALLBACK_CHAIN_ID_SET = new Set(TOKEN_PRICE_FALLBACK_CHAIN_IDS);
+const TRANSFERS_DEFAULT_CHAIN_ID = Number(process.env.TRANSFERS_DEFAULT_CHAIN_ID || 1);
+const TRANSFERS_DEFAULT_PAGE_SIZE = Number(process.env.TRANSFERS_DEFAULT_PAGE_SIZE || 25);
+const TRANSFERS_MAX_PAGE_SIZE = Number(process.env.TRANSFERS_MAX_PAGE_SIZE || 100);
+const TRANSFERS_PAGE_TTL_MS = Number(process.env.TRANSFERS_PAGE_TTL_MS || TWO_MINUTES);
+const TRANSFERS_TOTAL_TTL_MS = Number(process.env.TRANSFERS_TOTAL_TTL_MS || 15 * 60 * 1000);
+const TRANSFERS_TOTAL_FETCH_LIMIT = Number(process.env.TRANSFERS_TOTAL_FETCH_LIMIT || 10_000);
 
 const toNumericTimestamp = (timestamp) => {
   const parsed = Number(timestamp);
   return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const clampTransfersPageSize = (value) => {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return TRANSFERS_DEFAULT_PAGE_SIZE;
+  }
+
+  return Math.max(1, Math.min(Math.floor(numeric), TRANSFERS_MAX_PAGE_SIZE));
+};
+
+const normalizePageNumber = (value) => {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return 1;
+  }
+
+  return Math.floor(numeric);
+};
+
+const parseOptionalBlockNumber = (value) => {
+  if (typeof value === 'undefined') return undefined;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= 0 ? Math.floor(numeric) : undefined;
+};
+
+const getChainDefinition = (chainId) => CHAINS.find((chain) => chain.id === chainId);
+
+const buildTransfersPageCacheKey = ({ chainId, page, pageSize, sort, startBlock, endBlock }) => {
+  return [
+    chainId,
+    page,
+    pageSize,
+    sort,
+    typeof startBlock === 'number' ? startBlock : '',
+    typeof endBlock === 'number' ? endBlock : '',
+  ].join('|');
+};
+
+const buildTransfersTotalCacheKey = ({ chainId, startBlock, endBlock }) => {
+  return [
+    chainId,
+    typeof startBlock === 'number' ? startBlock : '',
+    typeof endBlock === 'number' ? endBlock : '',
+  ].join('|');
+};
+
+const getCachedTransfersPage = (key) => {
+  const entry = cache.transfersPageCache.get(key);
+  if (!entry) {
+    return null;
+  }
+
+  const age = Date.now() - entry.timestamp;
+  return {
+    payload: entry.payload,
+    timestamp: entry.timestamp,
+    age,
+    stale: age > TRANSFERS_PAGE_TTL_MS,
+  };
+};
+
+const setCachedTransfersPage = (key, payload) => {
+  cache.transfersPageCache.set(key, {
+    timestamp: Date.now(),
+    payload,
+  });
+};
+
+const getCachedTransfersTotal = (key) => {
+  const entry = cache.transfersTotalCache.get(key);
+  if (!entry) {
+    return null;
+  }
+
+  const age = Date.now() - entry.timestamp;
+  return {
+    payload: entry.payload,
+    timestamp: entry.timestamp,
+    age,
+    stale: age > TRANSFERS_TOTAL_TTL_MS,
+  };
+};
+
+const setCachedTransfersTotal = (key, payload) => {
+  cache.transfersTotalCache.set(key, {
+    timestamp: Date.now(),
+    payload,
+  });
+};
+
+const transfersPagePromises = new Map();
+const transfersTotalPromises = new Map();
+
+const sanitizeTransfers = (transfers, chain) => {
+  if (!Array.isArray(transfers)) {
+    return [];
+  }
+
+  const sanitized = [];
+  for (const tx of transfers) {
+    if (!tx || typeof tx.timeStamp === 'undefined') {
+      console.warn(`! Skipping transfer with missing timestamp on ${chain.name}`);
+      continue;
+    }
+
+    const numericTimestamp = Number(tx.timeStamp);
+    if (!Number.isFinite(numericTimestamp)) {
+      console.warn(`! Skipping transfer with non-numeric timestamp on ${chain.name}`);
+      continue;
+    }
+
+    sanitized.push({
+      ...tx,
+      chainName: chain.name,
+      chainId: chain.id,
+      timeStamp: String(tx.timeStamp),
+    });
+  }
+
+  return sanitized;
 };
 
 const respondUpstreamFailure = (res, message, details = {}) => {
@@ -90,6 +218,13 @@ const respondUpstreamFailure = (res, message, details = {}) => {
     upstream: 'etherscan',
     ...details,
   });
+};
+
+const getCachedTransfersWarmSummary = () => {
+  return {
+    chains: Array.isArray(cache.transfersWarmStatus) ? cache.transfersWarmStatus : [],
+    timestamp: cache.transfersWarmTimestamp || null,
+  };
 };
 
 const isProOnlyResponse = (payload = {}) => {
@@ -129,92 +264,98 @@ const mapWithConcurrency = async (items, limit, task) => {
 };
 
 let transfersRefreshPromise = null;
+const warmTransfersCacheForChain = async (chain, { forceRefresh = false, pageSize } = {}) => {
+  const startedAt = Date.now();
+  const normalizedPageSize = clampTransfersPageSize(pageSize || TRANSFERS_DEFAULT_PAGE_SIZE);
+  const summary = {
+    chainId: chain.id,
+    chainName: chain.name,
+    status: 'ok',
+    forceRefresh,
+    pageSize: normalizedPageSize,
+    durationMs: 0,
+    timestamp: Date.now(),
+    error: null,
+    errorCode: null,
+    warmed: false,
+    totalsWarmed: false,
+  };
 
-const buildTransfersResponsePayload = (isStale = false) => ({
-  data: Array.isArray(cache.transfers) ? cache.transfers : [],
-  chains: Array.isArray(cache.transfersChainStatus) ? cache.transfersChainStatus : [],
-  timestamp: cache.transfersTimestamp || null,
-  stale: Boolean(isStale),
-});
+  try {
+    await resolveTransfersPageData({
+      chain,
+      page: 1,
+      pageSize: normalizedPageSize,
+      sort: 'desc',
+      startBlock: undefined,
+      endBlock: undefined,
+      forceRefresh,
+    });
+    summary.warmed = true;
 
-const updateTransfersCache = async () => {
-  console.log('-> Refreshing /api/transfers cache from 10 chains...');
-  const allResults = await mapWithConcurrency(
+    await resolveTransfersTotalData({
+      chain,
+      sort: 'desc',
+      startBlock: undefined,
+      endBlock: undefined,
+      forceRefresh,
+    });
+    summary.totalsWarmed = true;
+  } catch (error) {
+    summary.status = 'error';
+    summary.error = error.message || String(error);
+    summary.errorCode = error.code || null;
+    summary.upstream = error.payload || null;
+  }
+
+  summary.durationMs = Date.now() - startedAt;
+  summary.timestamp = Date.now();
+  return summary;
+};
+
+const warmTransfersCaches = async ({ forceRefresh = false } = {}) => {
+  console.log('-> Warming paginated transfers cache across configured chains...');
+  const results = await mapWithConcurrency(
     CHAINS,
     MAX_CONCURRENT_REQUESTS,
-    (chain) => fetchTransfersForChain(chain)
+    async (chain) => {
+      const summary = await warmTransfersCacheForChain(chain, { forceRefresh });
+      return summary;
+    },
   );
 
-  let allTransfers = [];
-  const chainStatuses = CHAINS.map((chain, index) => {
-    const result = allResults[index];
-
-    if (result && result.status === 'fulfilled' && Array.isArray(result.value)) {
-      const sanitized = result.value
-        .filter((tx) => {
-          if (!tx || typeof tx.timeStamp === 'undefined') {
-            console.warn(`! Skipping transfer with missing timestamp on ${chain.name}`);
-            return false;
-          }
-          if (!Number.isFinite(Number(tx.timeStamp))) {
-            console.warn(`! Skipping transfer with non-numeric timestamp on ${chain.name}`);
-            return false;
-          }
-          return true;
-        })
-        .map((tx) => ({
-          ...tx,
-          timeStamp: String(tx.timeStamp),
-        }));
-
-      allTransfers.push(...sanitized);
-
-      return {
-        chainId: chain.id,
-        chainName: chain.name,
-        status: 'ok',
-        transferCount: sanitized.length,
-      };
+  const summaries = results.map((result, index) => {
+    if (result.status === 'fulfilled') {
+      return result.value;
     }
 
-    const errorReason = result?.status === 'rejected'
-      ? result.reason?.message || String(result.reason)
-      : 'Upstream response unavailable';
-
-    if (result?.status === 'rejected') {
-      console.error(`X Critical error fetching from chain ${chain.name}: ${errorReason}`);
-    } else {
-      console.error(`X Failed to fetch transfers for chain ${chain.name}: ${errorReason}`);
-    }
-
+    const chain = CHAINS[index];
     return {
       chainId: chain.id,
       chainName: chain.name,
       status: 'error',
-      transferCount: 0,
-      error: errorReason,
+      error: result.reason?.message || String(result.reason),
+      errorCode: result.reason?.code || null,
+      upstream: result.reason?.payload || null,
+      durationMs: 0,
+      timestamp: Date.now(),
+      forceRefresh,
     };
   });
 
-  allTransfers.sort((a, b) => toNumericTimestamp(b.timeStamp) - toNumericTimestamp(a.timeStamp));
-
-  cache.transfers = allTransfers;
-  cache.transfersTimestamp = Date.now();
-  cache.transfersChainStatus = chainStatuses;
-
-  console.log(`-> Cached ${allTransfers.length} transfers (updated ${new Date(cache.transfersTimestamp).toISOString()}).`);
-
-  return allTransfers;
+  cache.transfersWarmStatus = summaries;
+  cache.transfersWarmTimestamp = Date.now();
+  return summaries;
 };
 
-const triggerTransfersRefresh = () => {
+const triggerTransfersRefresh = ({ forceRefresh = false } = {}) => {
   if (transfersRefreshPromise) {
     return transfersRefreshPromise;
   }
 
-  transfersRefreshPromise = updateTransfersCache()
+  transfersRefreshPromise = warmTransfersCaches({ forceRefresh })
     .catch((error) => {
-      console.error('X Failed to refresh transfers cache:', error.message || error);
+      console.error('X Failed to warm transfers cache:', error.message || error);
       throw error;
     })
     .finally(() => {
@@ -230,7 +371,90 @@ const triggerTransfersRefresh = () => {
  * @param {object} chain - A chain object { id, name }
  * @returns {Promise<Array>} A promise that resolves to an array of transactions.
  */
-const fetchTransfersForChain = async (chain) => {
+const fetchTransfersPageFromChain = async ({ chain, page, pageSize, sort, startBlock, endBlock }) => {
+  const params = {
+    chainid: chain.id,
+    apikey: API_KEY,
+    module: 'account',
+    action: 'tokentx',
+    contractaddress: BZR_ADDRESS,
+    page,
+    offset: pageSize,
+    sort,
+  };
+
+  if (typeof startBlock === 'number') {
+    params.startblock = startBlock;
+  }
+  if (typeof endBlock === 'number') {
+    params.endblock = endBlock;
+  }
+
+  try {
+    const response = await axios.get(API_V2_BASE_URL, { params });
+    const payload = response?.data || {};
+
+    if (payload.status === '1' && Array.isArray(payload.result)) {
+      const sanitized = sanitizeTransfers(payload.result, chain);
+      return {
+        transfers: sanitized,
+        upstream: payload,
+        timestamp: Date.now(),
+        page,
+        pageSize,
+        sort,
+        startBlock,
+        endBlock,
+        resultLength: payload.result.length,
+      };
+    }
+
+    if (payload.status === '0') {
+      if (isProOnlyResponse(payload)) {
+        const error = new Error(payload?.result || payload?.message || 'Etherscan PRO plan required');
+        error.code = 'ETHERSCAN_PRO_ONLY';
+        error.payload = payload;
+        throw error;
+      }
+
+      const noRecordsMessage = String(payload?.message || payload?.result || '').toLowerCase();
+      if (noRecordsMessage.includes('no transactions')) {
+        return {
+          transfers: [],
+          upstream: payload,
+          timestamp: Date.now(),
+          page,
+          pageSize,
+          sort,
+          startBlock,
+          endBlock,
+          resultLength: 0,
+        };
+      }
+
+      const error = new Error(payload?.message || payload?.result || 'Failed to fetch token transfers');
+      error.code = 'ETHERSCAN_ERROR';
+      error.payload = payload;
+      throw error;
+    }
+
+    const error = new Error('Unexpected response from Etherscan');
+    error.code = 'ETHERSCAN_UNEXPECTED_RESPONSE';
+    error.payload = payload;
+    throw error;
+  } catch (error) {
+    if (error.response?.data) {
+      const wrappedError = new Error(error.message || 'Etherscan request failed');
+      wrappedError.code = 'ETHERSCAN_HTTP_ERROR';
+      wrappedError.payload = error.response.data;
+      throw wrappedError;
+    }
+
+    throw error;
+  }
+};
+
+const fetchTransfersTotalCount = async ({ chain, sort, startBlock, endBlock }) => {
   const params = {
     chainid: chain.id,
     apikey: API_KEY,
@@ -238,25 +462,263 @@ const fetchTransfersForChain = async (chain) => {
     action: 'tokentx',
     contractaddress: BZR_ADDRESS,
     page: 1,
-    offset: 50,
-    sort: 'desc',
+    offset: TRANSFERS_TOTAL_FETCH_LIMIT,
+    sort,
   };
+
+  if (typeof startBlock === 'number') {
+    params.startblock = startBlock;
+  }
+  if (typeof endBlock === 'number') {
+    params.endblock = endBlock;
+  }
 
   try {
     const response = await axios.get(API_V2_BASE_URL, { params });
-    if (response.data.status === '1') {
-      return response.data.result.map(tx => ({
-        ...tx,
-        chainName: chain.name,
-        chainId: chain.id,
-      }));
-    } else {
-      console.warn(`! No transfers found on chain ${chain.name}: ${response.data.message}`);
-      return [];
+    const payload = response?.data || {};
+
+    if (payload.status === '1') {
+      const numericCount = Number(payload.count);
+      const hasNumericCount = Number.isSafeInteger(numericCount) && numericCount >= 0;
+      const resultLength = Array.isArray(payload.result) ? payload.result.length : 0;
+      const total = hasNumericCount ? numericCount : resultLength;
+      const truncated = hasNumericCount
+        ? numericCount > TRANSFERS_TOTAL_FETCH_LIMIT
+        : resultLength === TRANSFERS_TOTAL_FETCH_LIMIT;
+
+      return {
+        total,
+        truncated,
+        timestamp: Date.now(),
+        resultLength,
+      };
     }
+
+    if (payload.status === '0') {
+      if (isProOnlyResponse(payload)) {
+        const error = new Error(payload?.result || payload?.message || 'Etherscan PRO plan required');
+        error.code = 'ETHERSCAN_PRO_ONLY';
+        error.payload = payload;
+        throw error;
+      }
+
+      const noRecordsMessage = String(payload?.message || payload?.result || '').toLowerCase();
+      if (noRecordsMessage.includes('no transactions')) {
+        return {
+          total: 0,
+          truncated: false,
+          timestamp: Date.now(),
+          resultLength: 0,
+        };
+      }
+
+      const error = new Error(payload?.message || payload?.result || 'Failed to fetch transfers total');
+      error.code = 'ETHERSCAN_ERROR';
+      error.payload = payload;
+      throw error;
+    }
+
+    const error = new Error('Unexpected response from Etherscan when computing total');
+    error.code = 'ETHERSCAN_UNEXPECTED_RESPONSE';
+    error.payload = payload;
+    throw error;
   } catch (error) {
-    console.error(`X Failed to fetch transfers for chain ${chain.name}: ${error.message}`);
-    return null; // null on critical error
+    if (error.response?.data) {
+      const wrappedError = new Error(error.message || 'Etherscan request failed');
+      wrappedError.code = 'ETHERSCAN_HTTP_ERROR';
+      wrappedError.payload = error.response.data;
+      throw wrappedError;
+    }
+
+    throw error;
+  }
+};
+
+const fetchTransfersPage = async ({ chain, page, pageSize, sort, startBlock, endBlock, cacheKey }) => {
+  const key = cacheKey || buildTransfersPageCacheKey({
+    chainId: chain.id,
+    page,
+    pageSize,
+    sort,
+    startBlock,
+    endBlock,
+  });
+
+  let promise = transfersPagePromises.get(key);
+  if (!promise) {
+    promise = fetchTransfersPageFromChain({
+      chain,
+      page,
+      pageSize,
+      sort,
+      startBlock,
+      endBlock,
+    })
+      .then((result) => {
+        setCachedTransfersPage(key, result);
+        return result;
+      })
+      .finally(() => {
+        transfersPagePromises.delete(key);
+      });
+
+    transfersPagePromises.set(key, promise);
+  }
+
+  return promise;
+};
+
+const fetchTransfersTotal = async ({ chain, sort, startBlock, endBlock, cacheKey }) => {
+  const key = cacheKey || buildTransfersTotalCacheKey({
+    chainId: chain.id,
+    startBlock,
+    endBlock,
+  });
+
+  let promise = transfersTotalPromises.get(key);
+  if (!promise) {
+    promise = fetchTransfersTotalCount({
+      chain,
+      sort,
+      startBlock,
+      endBlock,
+    })
+      .then((result) => {
+        setCachedTransfersTotal(key, result);
+        return result;
+      })
+      .finally(() => {
+        transfersTotalPromises.delete(key);
+      });
+
+    transfersTotalPromises.set(key, promise);
+  }
+
+  return promise;
+};
+
+const resolveTransfersPageData = async ({
+  chain,
+  page,
+  pageSize,
+  sort,
+  startBlock,
+  endBlock,
+  forceRefresh = false,
+}) => {
+  const cacheKey = buildTransfersPageCacheKey({
+    chainId: chain.id,
+    page,
+    pageSize,
+    sort,
+    startBlock,
+    endBlock,
+  });
+
+  if (forceRefresh) {
+    cache.transfersPageCache.delete(cacheKey);
+    transfersPagePromises.delete(cacheKey);
+  }
+
+  const cached = forceRefresh ? null : getCachedTransfersPage(cacheKey);
+  if (cached && !cached.stale && cached.payload) {
+    return {
+      ...cached.payload,
+      cacheTimestamp: cached.timestamp,
+      stale: false,
+      source: 'cache',
+    };
+  }
+
+  try {
+    const fresh = await fetchTransfersPage({
+      chain,
+      page,
+      pageSize,
+      sort,
+      startBlock,
+      endBlock,
+      cacheKey,
+    });
+
+    return {
+      ...fresh,
+      cacheTimestamp: fresh.timestamp,
+      stale: false,
+      source: 'network',
+    };
+  } catch (error) {
+    if (cached?.payload) {
+      console.warn(`! Returning stale /api/transfers data for chain ${chain.name}: ${error.message || error}`);
+      return {
+        ...cached.payload,
+        cacheTimestamp: cached.timestamp,
+        stale: true,
+        source: 'stale-cache',
+        error,
+      };
+    }
+
+    throw error;
+  }
+};
+
+const resolveTransfersTotalData = async ({
+  chain,
+  sort,
+  startBlock,
+  endBlock,
+  forceRefresh = false,
+}) => {
+  const cacheKey = buildTransfersTotalCacheKey({
+    chainId: chain.id,
+    startBlock,
+    endBlock,
+  });
+
+  if (forceRefresh) {
+    cache.transfersTotalCache.delete(cacheKey);
+    transfersTotalPromises.delete(cacheKey);
+  }
+
+  const cached = forceRefresh ? null : getCachedTransfersTotal(cacheKey);
+  if (cached && !cached.stale && cached.payload) {
+    return {
+      ...cached.payload,
+      cacheTimestamp: cached.timestamp,
+      stale: false,
+      source: 'cache',
+    };
+  }
+
+  try {
+    const fresh = await fetchTransfersTotal({
+      chain,
+      sort,
+      startBlock,
+      endBlock,
+      cacheKey,
+    });
+
+    return {
+      ...fresh,
+      cacheTimestamp: fresh.timestamp,
+      stale: false,
+      source: 'network',
+    };
+  } catch (error) {
+    if (cached?.payload) {
+      console.warn(`! Returning stale transfers total for chain ${chain.name}: ${error.message || error}`);
+      return {
+        ...cached.payload,
+        cacheTimestamp: cached.timestamp,
+        stale: true,
+        source: 'stale-cache',
+        error,
+      };
+    }
+
+    throw error;
   }
 };
 
@@ -722,46 +1184,148 @@ app.get('/api/info', async (req, res) => {
 app.get('/api/transfers', async (req, res) => {
   console.log(`[${new Date().toISOString()}] Received request for /api/transfers`);
 
+  if (!API_KEY || !BZR_ADDRESS) {
+    return res.status(500).json({ message: 'Server missing ETHERSCAN_V2_API_KEY or BZR_TOKEN_ADDRESS' });
+  }
+
   const forceRefresh = String(req.query.force).toLowerCase() === 'true';
-  const now = Date.now();
-  const cacheAge = cache.transfersTimestamp ? now - cache.transfersTimestamp : Infinity;
-  const hasCache = Array.isArray(cache.transfers) && cache.transfersTimestamp;
-  const isFresh = cacheAge < TWO_MINUTES;
+  const requestedChainId = Number(req.query.chainId || TRANSFERS_DEFAULT_CHAIN_ID);
+  const requestedPage = normalizePageNumber(req.query.page || 1);
+  const requestedPageSize = clampTransfersPageSize(req.query.pageSize || TRANSFERS_DEFAULT_PAGE_SIZE);
+  const sortParam = typeof req.query.sort === 'string' ? req.query.sort.toLowerCase() : 'desc';
+  const sort = sortParam === 'asc' ? 'asc' : 'desc';
+  const startBlock = parseOptionalBlockNumber(req.query.startBlock);
+  const endBlock = parseOptionalBlockNumber(req.query.endBlock);
+  const includeTotals = req.query.includeTotals !== 'false';
 
-  if (!hasCache || forceRefresh) {
-    if (!hasCache) {
-      console.log('-> No cached transfers available. Performing blocking refresh.');
-    } else if (forceRefresh) {
-      console.log('-> Force refresh requested. Waiting for fresh transfer data.');
-    }
-
-    try {
-      await triggerTransfersRefresh();
-      return res.json(buildTransfersResponsePayload(false));
-    } catch (error) {
-      console.error('Error in forced /api/transfers refresh:', error.message || error);
-      if (error.response?.data) {
-        return respondUpstreamFailure(res, 'Failed to fetch transfers from Etherscan', {
-          upstreamResponse: error.response.data,
-        });
-      }
-
-      return res.status(500).json({ message: 'Failed to fetch transfers', error: error.message || String(error) });
-    }
+  if (typeof startBlock === 'number' && typeof endBlock === 'number' && startBlock > endBlock) {
+    return res.status(400).json({
+      message: 'startBlock cannot be greater than endBlock',
+      startBlock,
+      endBlock,
+    });
   }
 
-  const isStale = !isFresh;
-  if (isStale) {
-    console.log('-> Returning stale cached /api/transfers data while refreshing in background.');
-  } else {
-    console.log('-> Returning fresh cached /api/transfers data.');
+  const chain = getChainDefinition(requestedChainId) || getChainDefinition(TRANSFERS_DEFAULT_CHAIN_ID) || CHAINS[0];
+  if (!chain) {
+    return res.status(400).json({
+      message: 'Unsupported chain requested',
+      chainId: requestedChainId,
+      availableChains: CHAINS,
+    });
   }
 
-  res.json(buildTransfersResponsePayload(isStale));
+  try {
+    const pageData = await resolveTransfersPageData({
+      chain,
+      page: requestedPage,
+      pageSize: requestedPageSize,
+      sort,
+      startBlock,
+      endBlock,
+      forceRefresh,
+    });
 
-  if (isStale) {
-    triggerTransfersRefresh().catch((error) => {
-      console.error('X Background refresh for /api/transfers failed:', error.message || error);
+    let totalsData = null;
+    if (includeTotals) {
+      totalsData = await resolveTransfersTotalData({
+        chain,
+        sort,
+        startBlock,
+        endBlock,
+        forceRefresh,
+      });
+    }
+
+    const totalCount = totalsData ? totalsData.total : pageData.resultLength || 0;
+    const totalPages = totalCount > 0 ? Math.ceil(totalCount / requestedPageSize) : 0;
+    const hasMore = totalCount > requestedPage * requestedPageSize;
+    const timestamp = pageData.timestamp || pageData.cacheTimestamp || Date.now();
+    const warnings = [];
+
+    if (pageData.stale && pageData.error) {
+      warnings.push({
+        scope: 'page',
+        code: pageData.error.code || 'STALE_PAGE',
+        message: pageData.error.message || 'Page data returned from stale cache after upstream failure.',
+      });
+    }
+
+    if (totalsData?.stale && totalsData.error) {
+      warnings.push({
+        scope: 'total',
+        code: totalsData.error.code || 'STALE_TOTAL',
+        message: totalsData.error.message || 'Total count returned from stale cache after upstream failure.',
+      });
+    }
+
+    res.json({
+      data: Array.isArray(pageData.transfers) ? pageData.transfers : [],
+      pagination: {
+        page: requestedPage,
+        pageSize: requestedPageSize,
+        total: totalCount,
+        totalPages,
+        hasMore,
+      },
+      totals: totalsData
+        ? {
+            total: totalsData.total,
+            truncated: totalsData.truncated,
+            resultLength: totalsData.resultLength,
+            timestamp: totalsData.timestamp,
+            stale: totalsData.stale,
+            source: totalsData.source,
+          }
+        : null,
+      chain: {
+        id: chain.id,
+        name: chain.name,
+      },
+      sort,
+      filters: {
+        startBlock: typeof startBlock === 'number' ? startBlock : null,
+        endBlock: typeof endBlock === 'number' ? endBlock : null,
+      },
+      timestamp,
+      stale: Boolean(pageData.stale || totalsData?.stale),
+      source: pageData.source,
+      warnings,
+      limits: {
+        maxPageSize: TRANSFERS_MAX_PAGE_SIZE,
+        totalFetchLimit: TRANSFERS_TOTAL_FETCH_LIMIT,
+      },
+      defaults: {
+        chainId: TRANSFERS_DEFAULT_CHAIN_ID,
+        pageSize: TRANSFERS_DEFAULT_PAGE_SIZE,
+        sort: 'desc',
+      },
+      availableChains: CHAINS.map((c) => ({ id: c.id, name: c.name })),
+      request: {
+        forceRefresh,
+        includeTotals,
+      },
+    });
+  } catch (error) {
+    console.error('Error handling /api/transfers request:', error.message || error);
+
+    if (error.code === 'ETHERSCAN_PRO_ONLY') {
+      return res.status(402).json({
+        message: 'Etherscan PRO plan required for this request',
+        details: error.payload || null,
+      });
+    }
+
+    if (error.code && error.payload) {
+      return respondUpstreamFailure(res, 'Failed to fetch transfers from Etherscan', {
+        errorCode: error.code,
+        upstreamResponse: error.payload,
+      });
+    }
+
+    return res.status(500).json({
+      message: 'Failed to fetch transfers',
+      error: error.message || String(error),
     });
   }
 });
