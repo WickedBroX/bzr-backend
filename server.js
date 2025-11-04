@@ -795,7 +795,33 @@ const handleAggregatedTransfers = async (req, res, options) => {
     // Combine all transfers
     const allTransfers = [];
     const chainSummaries = [];
-    let totalCount = 0;
+    let displayCount = 0; // Count of transfers fetched for display
+    let allTimeTotal = 0; // True all-time total from cached individual chain totals
+    let allTimeTotalAvailable = true;
+
+    // Fetch cached totals from each chain for all-time stats
+    const chainTotalsPromises = CHAINS.map(async (chain) => {
+      try {
+        const cacheKey = buildTransfersTotalCacheKey({
+          chainId: chain.id,
+          startBlock: undefined,
+          endBlock: undefined,
+        });
+        const cached = getCachedTransfersTotal(cacheKey);
+        return cached?.payload?.total || 0;
+      } catch (error) {
+        console.warn(`! Could not get cached total for ${chain.name}`);
+        return 0;
+      }
+    });
+
+    const chainTotals = await Promise.all(chainTotalsPromises);
+    allTimeTotal = chainTotals.reduce((sum, total) => sum + (total || 0), 0);
+    
+    // If no cached totals available, mark as unavailable
+    if (allTimeTotal === 0) {
+      allTimeTotalAvailable = false;
+    }
 
     results.forEach((result) => {
       if (result.status === 'fulfilled' && result.value.data) {
@@ -835,20 +861,29 @@ const handleAggregatedTransfers = async (req, res, options) => {
     const start = (requestedPage - 1) * requestedPageSize;
     const end = start + requestedPageSize;
     const paginatedTransfers = allTransfers.slice(start, end);
-    totalCount = allTransfers.length;
+    displayCount = allTransfers.length; // Transfers fetched for current display
 
-    const totalPages = totalCount > 0 ? Math.ceil(totalCount / requestedPageSize) : 1;
-    const hasMore = totalCount > requestedPage * requestedPageSize;
+    const totalPages = displayCount > 0 ? Math.ceil(displayCount / requestedPageSize) : 1;
+    const hasMore = displayCount > requestedPage * requestedPageSize;
 
     const warmSummary = getCachedTransfersWarmSummary();
     const warnings = [];
+    
+    if (!allTimeTotalAvailable) {
+      warnings.push({
+        scope: 'total',
+        code: 'ALL_TIME_TOTAL_UNAVAILABLE',
+        message: 'All-time transfer totals not yet cached. Displaying current page data only.',
+        retryable: true,
+      });
+    }
 
     res.json({
       data: paginatedTransfers,
       pagination: {
         page: requestedPage,
         pageSize: requestedPageSize,
-        total: totalCount,
+        total: displayCount, // Display count for current view pagination
         totalPages,
         hasMore,
         windowExceeded: false,
@@ -857,12 +892,14 @@ const handleAggregatedTransfers = async (req, res, options) => {
       },
       totals: includeTotals
         ? {
-            total: totalCount,
+            total: displayCount, // Display total for pagination
+            allTimeTotal: allTimeTotalAvailable ? allTimeTotal : null, // True all-time total across all chains
             truncated: false,
-            resultLength: totalCount,
+            resultLength: displayCount,
             timestamp: Date.now(),
             stale: false,
             source: 'aggregated',
+            allTimeTotalAvailable,
           }
         : null,
       chain: {
