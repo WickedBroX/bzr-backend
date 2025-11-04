@@ -202,7 +202,7 @@ const TRANSFERS_DEFAULT_PAGE_SIZE = Number(process.env.TRANSFERS_DEFAULT_PAGE_SI
 const TRANSFERS_MAX_PAGE_SIZE = Number(process.env.TRANSFERS_MAX_PAGE_SIZE || 100);
 const TRANSFERS_PAGE_TTL_MS = Number(process.env.TRANSFERS_PAGE_TTL_MS || TWO_MINUTES);
 const TRANSFERS_TOTAL_TTL_MS = Number(process.env.TRANSFERS_TOTAL_TTL_MS || 15 * 60 * 1000);
-const TRANSFERS_TOTAL_FETCH_LIMIT = Number(process.env.TRANSFERS_TOTAL_FETCH_LIMIT || 10_000);
+const TRANSFERS_TOTAL_FETCH_LIMIT = Number(process.env.TRANSFERS_TOTAL_FETCH_LIMIT || 25_000);
 
 const toNumericTimestamp = (timestamp) => {
   const parsed = Number(timestamp);
@@ -1711,7 +1711,7 @@ app.get('/api/transfers', async (req, res) => {
   }
 
   try {
-    const pageData = await resolveTransfersPageData({
+    const pagePromise = resolveTransfersPageData({
       chain,
       page: requestedPage,
       pageSize: requestedPageSize,
@@ -1721,24 +1721,39 @@ app.get('/api/transfers', async (req, res) => {
       forceRefresh,
     });
 
-    let totalsData = null;
-    if (includeTotals) {
-      totalsData = await resolveTransfersTotalData({
-        chain,
-        sort,
-        startBlock,
-        endBlock,
-        forceRefresh,
-      });
+    const totalsPromise = includeTotals
+      ? resolveTransfersTotalData({
+          chain,
+          sort,
+          startBlock,
+          endBlock,
+          forceRefresh,
+        })
+      : Promise.resolve(null);
+
+    const [pageOutcome, totalsOutcome] = await Promise.allSettled([pagePromise, totalsPromise]);
+
+    if (pageOutcome.status !== 'fulfilled') {
+      throw pageOutcome.reason;
     }
 
+    const pageData = pageOutcome.value;
     const warmSummary = getCachedTransfersWarmSummary();
-
-    const totalCount = totalsData ? totalsData.total : pageData.resultLength || 0;
-    const totalPages = totalCount > 0 ? Math.ceil(totalCount / requestedPageSize) : 0;
-    const hasMore = totalCount > requestedPage * requestedPageSize;
-    const timestamp = pageData.timestamp || pageData.cacheTimestamp || Date.now();
     const warnings = [];
+
+    let totalsData = null;
+    if (totalsOutcome.status === 'fulfilled') {
+      totalsData = totalsOutcome.value;
+    } else if (includeTotals) {
+      const reason = totalsOutcome.reason || {};
+      console.warn(`! Failed to refresh transfer totals for ${chain.name}: ${reason.message || reason}`);
+      warnings.push({
+        scope: 'total',
+        code: reason.code || 'TOTAL_FETCH_FAILED',
+        message: reason.message || 'Failed to compute total transfer count; returning latest page data only.',
+        retryable: true,
+      });
+    }
 
     if (pageData.stale && pageData.error) {
       warnings.push({
@@ -1755,6 +1770,11 @@ app.get('/api/transfers', async (req, res) => {
         message: totalsData.error.message || 'Total count returned from stale cache after upstream failure.',
       });
     }
+
+    const totalCount = totalsData ? totalsData.total : pageData.resultLength || 0;
+    const totalPages = totalCount > 0 ? Math.ceil(totalCount / requestedPageSize) : 0;
+    const hasMore = totalCount > requestedPage * requestedPageSize;
+    const timestamp = pageData.timestamp || pageData.cacheTimestamp || Date.now();
 
     res.json({
       data: Array.isArray(pageData.transfers) ? pageData.transfers : [],
@@ -2008,7 +2028,7 @@ app.listen(PORT, () => {
   if (CACHE_WARM_INTERVAL_MS > 0) {
     console.log(`Cache warming enabled (interval ${CACHE_WARM_INTERVAL_MS}ms).`);
 
-    triggerTransfersRefresh().catch((error) => {
+    triggerTransfersRefresh({ forceRefresh: true }).catch((error) => {
       console.error('X Initial transfers cache warm failed:', error.message || error);
     });
 
