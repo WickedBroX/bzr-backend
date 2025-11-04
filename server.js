@@ -59,6 +59,7 @@ const TWO_MINUTES = 2 * 60 * 1000; // Transfers and Stats are cached for 2 mins
 const CACHE_WARM_INTERVAL_MS = Number(process.env.CACHE_WARM_INTERVAL_MS || 90_000);
 const TOKEN_PRICE_TTL_MS = Number(process.env.TOKEN_PRICE_TTL_MS || 60_000);
 const FINALITY_TTL_MS = Number(process.env.FINALITY_TTL_MS || 30_000);
+const FINALITY_FALLBACK_RPC_URL = process.env.FINALITY_FALLBACK_RPC_URL || 'https://eth.llamarpc.com';
 
 const toNumericTimestamp = (timestamp) => {
   const parsed = Number(timestamp);
@@ -331,7 +332,27 @@ const fetchTokenPrice = async () => {
   }
 };
 
-const fetchFinalizedBlock = async () => {
+const parseFinalizedBlockPayload = (result, source) => {
+  if (!result || typeof result.number !== 'string') {
+    throw new Error(`[${source}] Finalized block response missing number`);
+  }
+
+  const blockNumberHex = result.number;
+  const blockNumber = Number.parseInt(blockNumberHex, 16);
+
+  if (!Number.isFinite(blockNumber)) {
+    throw new Error(`[${source}] Invalid block number: ${blockNumberHex}`);
+  }
+
+  return {
+    blockNumber,
+    blockNumberHex,
+    timestamp: Date.now(),
+    source,
+  };
+};
+
+const fetchFinalizedBlockFromEtherscan = async () => {
   const params = {
     chainid: 1,
     apikey: API_KEY,
@@ -345,22 +366,71 @@ const fetchFinalizedBlock = async () => {
     const response = await axios.get(API_V2_BASE_URL, { params });
     const result = response.data?.result;
 
-    if (!result || typeof result.number !== 'string') {
-      throw new Error('Finalized block response missing number');
-    }
-
-    const blockNumberHex = result.number;
-    const blockNumber = Number.parseInt(blockNumberHex, 16);
-
-    return {
-      blockNumber,
-      blockNumberHex,
-      timestamp: Date.now(),
-      source: 'etherscan',
-    };
+    return parseFinalizedBlockPayload(result, 'etherscan');
   } catch (error) {
     console.error('X Failed to fetch finalized block:', error.message || error);
     throw error;
+  }
+};
+
+const fetchFinalizedBlockFromRpc = async () => {
+  const payload = {
+    jsonrpc: '2.0',
+    id: Date.now(),
+    method: 'eth_getBlockByNumber',
+    params: ['finalized', true],
+  };
+
+  try {
+    const response = await axios.post(
+      FINALITY_FALLBACK_RPC_URL,
+      payload,
+      {
+        headers: { 'Content-Type': 'application/json' },
+      }
+    );
+
+    if (response.data?.error) {
+      const message = response.data.error?.message || 'Unknown RPC error';
+      const code = response.data.error?.code;
+      throw new Error(`[rpc:${FINALITY_FALLBACK_RPC_URL}] ${message}${typeof code !== 'undefined' ? ` (code ${code})` : ''}`);
+    }
+
+    return parseFinalizedBlockPayload(response.data?.result, `rpc:${FINALITY_FALLBACK_RPC_URL}`);
+  } catch (error) {
+    console.error('X Fallback RPC finalized block request failed:', error.message || error);
+    throw error;
+  }
+};
+
+const fetchFinalizedBlock = async () => {
+  try {
+    return await fetchFinalizedBlockFromEtherscan();
+  } catch (primaryError) {
+    const message = primaryError?.response?.data?.error?.message || primaryError?.response?.data?.message || primaryError?.message || '';
+    const code = primaryError?.response?.data?.error?.code;
+    const shouldFallback =
+      code === -32602 ||
+      /invalid hex string/i.test(message) ||
+      /unsupported/i.test(message) ||
+      /missing number/i.test(message);
+
+    if (!shouldFallback) {
+      throw primaryError;
+    }
+
+    console.warn('! Etherscan does not support finalized tag currently — attempting fallback RPC.');
+
+    try {
+      return await fetchFinalizedBlockFromRpc();
+    } catch (fallbackError) {
+      const aggregate = new Error('Failed to fetch finalized block from both Etherscan and fallback RPC');
+      aggregate.cause = {
+        primaryError: primaryError.message || primaryError,
+        fallbackError: fallbackError.message || fallbackError,
+      };
+      throw aggregate;
+    }
   }
 };
 
