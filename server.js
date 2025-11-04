@@ -1838,7 +1838,7 @@ app.get('/api/info', async (req, res) => {
     apikey: ETHERSCAN_API_KEY,
   };
 
-  // We will make two API calls in parallel to get all the info we need
+  // We will make three API calls in parallel to get all the info we need
 
   // Call 1: Get Total Supply
   const supplyParams = {
@@ -1859,12 +1859,21 @@ app.get('/api/info', async (req, res) => {
     sort: 'desc',
   };
 
+  // Call 3: Get detailed token info including circulating supply
+  const tokenInfoParams = {
+    ...params,
+    module: 'token',
+    action: 'tokeninfo',
+    contractaddress: BZR_ADDRESS,
+  };
+
   try {
     console.log('-> Fetching new /api/info data from Etherscan...');
-    // Run both requests in parallel
-    const [supplyResponse, txResponse] = await Promise.all([
+    // Run all three requests in parallel
+    const [supplyResponse, txResponse, tokenInfoResponse] = await Promise.all([
       axios.get(API_V2_BASE_URL, { params: supplyParams }),
       axios.get(API_V2_BASE_URL, { params: txParams }),
+      axios.get(API_V2_BASE_URL, { params: tokenInfoParams }),
     ]);
 
     // Check for API errors
@@ -1873,6 +1882,7 @@ app.get('/api/info', async (req, res) => {
       return respondUpstreamFailure(res, 'Upstream Etherscan API error while fetching token info', {
         supplyError: supplyResponse.data.message,
         txError: txResponse.data.message,
+        tokenInfoError: tokenInfoResponse.data.message,
       });
     }
 
@@ -1889,14 +1899,31 @@ app.get('/api/info', async (req, res) => {
 
     const { tokenName, tokenSymbol, tokenDecimal } = lastTx;
     
+    // 3. Data from Token Info call (includes circulating supply)
+    let circulatingSupply = null;
+    let formattedCirculatingSupply = null;
+    if (tokenInfoResponse.data.status === '1' && Array.isArray(tokenInfoResponse.data.result)) {
+      const tokenInfoData = tokenInfoResponse.data.result[0];
+      if (tokenInfoData && tokenInfoData.circulatingSupply) {
+        circulatingSupply = tokenInfoData.circulatingSupply;
+        try {
+          formattedCirculatingSupply = (BigInt(circulatingSupply) / BigInt(10 ** parseInt(tokenDecimal, 10))).toString();
+        } catch (e) {
+          console.warn('! Could not format circulating supply:', e.message);
+        }
+      }
+    }
+    
     // --- Combine and Send ---
     const tokenInfo = {
       tokenName,
       tokenSymbol,
       tokenDecimal: parseInt(tokenDecimal, 10),
       totalSupply,
-      // We add this helper to format the supply on the frontend
+      circulatingSupply,
+      // We add helpers to format the supply on the frontend
       formattedTotalSupply: (BigInt(totalSupply) / BigInt(10 ** parseInt(tokenDecimal, 10))).toString(),
+      formattedCirculatingSupply,
     };
 
     // Store in cache
@@ -2317,6 +2344,48 @@ app.get('/api/finality', async (req, res) => {
 // --- Health Check Route ---
 app.get('/', (req, res) => {
   res.send('BZR Token Explorer Backend is running! (v4: ALL ENDPOINTS LIVE)');
+});
+
+// Cache invalidation endpoint - useful for forcing fresh data after contract changes
+app.post('/api/cache/invalidate', (req, res) => {
+  console.log(`[${new Date().toISOString()}] Cache invalidation requested`);
+  
+  // Clear all caches
+  cache.info = null;
+  cache.infoTimestamp = 0;
+  cache.stats = null;
+  cache.statsTimestamp = 0;
+  cache.tokenPrice = null;
+  cache.tokenPriceTimestamp = 0;
+  cache.finalizedBlock = null;
+  cache.finalizedBlockTimestamp = 0;
+  
+  // Clear transfers caches
+  cache.transfersPageCache.clear();
+  cache.transfersTotalCache.clear();
+  cache.transfersWarmStatus = [];
+  cache.transfersWarmTimestamp = null;
+  
+  // Clear in-flight promises
+  transfersPagePromises.clear();
+  transfersTotalPromises.clear();
+  
+  console.log('-> All caches cleared successfully');
+  console.log(`-> Current BZR Token Address: ${BZR_ADDRESS}`);
+  
+  // Trigger immediate cache warm
+  if (CACHE_WARM_INTERVAL_MS > 0) {
+    console.log('-> Triggering immediate cache warm...');
+    triggerTransfersRefresh({ forceRefresh: true }).catch((error) => {
+      console.error('X Cache warm after invalidation failed:', error.message || error);
+    });
+  }
+  
+  res.json({
+    message: 'All caches invalidated successfully',
+    tokenAddress: BZR_ADDRESS,
+    timestamp: Date.now(),
+  });
 });
 
 // --- Start Server ---
