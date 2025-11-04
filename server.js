@@ -203,6 +203,7 @@ const TRANSFERS_MAX_PAGE_SIZE = Number(process.env.TRANSFERS_MAX_PAGE_SIZE || 10
 const TRANSFERS_PAGE_TTL_MS = Number(process.env.TRANSFERS_PAGE_TTL_MS || TWO_MINUTES);
 const TRANSFERS_TOTAL_TTL_MS = Number(process.env.TRANSFERS_TOTAL_TTL_MS || 15 * 60 * 1000);
 const TRANSFERS_TOTAL_FETCH_LIMIT = Number(process.env.TRANSFERS_TOTAL_FETCH_LIMIT || 25_000);
+const ETHERSCAN_RESULT_WINDOW = Number(process.env.ETHERSCAN_RESULT_WINDOW || 10_000);
 
 const toNumericTimestamp = (timestamp) => {
   const parsed = Number(timestamp);
@@ -1710,16 +1711,38 @@ app.get('/api/transfers', async (req, res) => {
     return res.status(500).json({ message: providerError.message });
   }
 
+  const chainIsCronos = isCronosChain(chain);
+  const resultWindowLimit = !chainIsCronos && Number.isFinite(ETHERSCAN_RESULT_WINDOW)
+    ? Math.max(0, ETHERSCAN_RESULT_WINDOW)
+    : null;
+  const maxWindowPagesForRequest = resultWindowLimit
+    ? Math.max(1, Math.floor(resultWindowLimit / requestedPageSize) || 1)
+    : null;
+  const requestExceedsWindow = Boolean(resultWindowLimit && requestedPage > maxWindowPagesForRequest);
+
   try {
-    const pagePromise = resolveTransfersPageData({
-      chain,
-      page: requestedPage,
-      pageSize: requestedPageSize,
-      sort,
-      startBlock,
-      endBlock,
-      forceRefresh,
-    });
+    const pagePromise = requestExceedsWindow
+      ? Promise.resolve({
+          transfers: [],
+          upstream: null,
+          timestamp: Date.now(),
+          page: requestedPage,
+          pageSize: requestedPageSize,
+          sort,
+          startBlock,
+          endBlock,
+          resultLength: 0,
+          windowExceeded: true,
+        })
+      : resolveTransfersPageData({
+          chain,
+          page: requestedPage,
+          pageSize: requestedPageSize,
+          sort,
+          startBlock,
+          endBlock,
+          forceRefresh,
+        });
 
     const totalsPromise = includeTotals
       ? resolveTransfersTotalData({
@@ -1771,9 +1794,30 @@ app.get('/api/transfers', async (req, res) => {
       });
     }
 
+    const windowExceeded = Boolean(pageData.windowExceeded || requestExceedsWindow);
+    if (windowExceeded && resultWindowLimit) {
+      warnings.push({
+        scope: 'page',
+        code: 'RESULT_WINDOW_CAP',
+        message: `Etherscan only returns the latest ${resultWindowLimit.toLocaleString()} transfers per query. Reduce the page size or apply block filters to view older activity.`,
+      });
+    }
+
     const totalCount = totalsData ? totalsData.total : pageData.resultLength || 0;
-    const totalPages = totalCount > 0 ? Math.ceil(totalCount / requestedPageSize) : 0;
-    const hasMore = totalCount > requestedPage * requestedPageSize;
+    const totalPagesRaw = totalCount > 0 ? Math.ceil(totalCount / requestedPageSize) : (pageData.resultLength === requestedPageSize ? requestedPage + 1 : requestedPage);
+    const totalPages = maxWindowPagesForRequest
+      ? Math.min(totalPagesRaw || maxWindowPagesForRequest, maxWindowPagesForRequest)
+      : totalPagesRaw;
+    let hasMore = pageData.resultLength === requestedPageSize;
+    if (totalCount > 0) {
+      hasMore = totalCount > requestedPage * requestedPageSize;
+    }
+    if (maxWindowPagesForRequest && requestedPage >= maxWindowPagesForRequest) {
+      hasMore = false;
+    }
+    if (windowExceeded) {
+      hasMore = false;
+    }
     const timestamp = pageData.timestamp || pageData.cacheTimestamp || Date.now();
 
     res.json({
@@ -1784,6 +1828,9 @@ app.get('/api/transfers', async (req, res) => {
         total: totalCount,
         totalPages,
         hasMore,
+        windowExceeded,
+        maxWindowPages: maxWindowPagesForRequest,
+        resultWindow: resultWindowLimit,
       },
       totals: totalsData
         ? {
@@ -1811,6 +1858,7 @@ app.get('/api/transfers', async (req, res) => {
       limits: {
         maxPageSize: TRANSFERS_MAX_PAGE_SIZE,
         totalFetchLimit: TRANSFERS_TOTAL_FETCH_LIMIT,
+        resultWindow: resultWindowLimit,
       },
       defaults: {
         chainId: TRANSFERS_DEFAULT_CHAIN_ID,
