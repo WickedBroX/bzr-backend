@@ -1237,6 +1237,8 @@ app.get('/api/transfers', async (req, res) => {
       });
     }
 
+    const warmSummary = getCachedTransfersWarmSummary();
+
     const totalCount = totalsData ? totalsData.total : pageData.resultLength || 0;
     const totalPages = totalCount > 0 ? Math.ceil(totalCount / requestedPageSize) : 0;
     const hasMore = totalCount > requestedPage * requestedPageSize;
@@ -1300,6 +1302,11 @@ app.get('/api/transfers', async (req, res) => {
         pageSize: TRANSFERS_DEFAULT_PAGE_SIZE,
         sort: 'desc',
       },
+      warm: {
+        chains: warmSummary.chains,
+        timestamp: warmSummary.timestamp,
+      },
+      chains: warmSummary.chains,
       availableChains: CHAINS.map((c) => ({ id: c.id, name: c.name })),
       request: {
         forceRefresh,
@@ -1406,8 +1413,8 @@ app.get('/api/cache-health', (req, res) => {
 
   res.json({
     info: withMeta(cache.info, cache.infoTimestamp, FIVE_MINUTES),
-    transfers: withMeta(cache.transfers, cache.transfersTimestamp, TWO_MINUTES),
-    transferChains: cache.transfersChainStatus,
+    transfersWarm: withMeta(cache.transfersWarmStatus, cache.transfersWarmTimestamp, TWO_MINUTES),
+    transferWarmChains: cache.transfersWarmStatus,
     stats: withMeta(cache.stats, cache.statsTimestamp, TWO_MINUTES),
     tokenPrice: {
       ...withMeta(cache.tokenPrice, cache.tokenPriceTimestamp, TOKEN_PRICE_TTL_MS),
