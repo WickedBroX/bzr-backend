@@ -19,6 +19,9 @@ const API_V2_BASE_URL = 'https://api.etherscan.io/v2/api';
 const CRONOS_API_KEY = process.env.CRONOS_API_KEY;
 const CRONOS_API_BASE_URL = process.env.CRONOS_API_BASE_URL || 'https://explorer-api.cronos.org/mainnet/api/v2';
 const MAX_CONCURRENT_REQUESTS = Number(process.env.ETHERSCAN_CONCURRENCY || 3);
+const TOKEN_PRICE_COINGECKO_ID = (process.env.TOKEN_PRICE_COINGECKO_ID || 'bazaars').trim();
+const TOKEN_PRICE_COINGECKO_TIMEOUT_MS = Number(process.env.TOKEN_PRICE_COINGECKO_TIMEOUT_MS || 5_000);
+const TOKEN_PRICE_COINGECKO_ENABLED = TOKEN_PRICE_COINGECKO_ID.length > 0 && TOKEN_PRICE_COINGECKO_ID.toLowerCase() !== 'disabled';
 
 const PROVIDERS = {
   etherscan: {
@@ -190,6 +193,10 @@ const TOKEN_PRICE_FALLBACK_TIMEOUT_MS = Number(process.env.TOKEN_PRICE_FALLBACK_
 const TOKEN_PRICE_FALLBACK_SYMBOL_SET = new Set(TOKEN_PRICE_FALLBACK_SYMBOLS);
 const TOKEN_PRICE_FALLBACK_BASE_ADDRESS_SET = new Set(TOKEN_PRICE_FALLBACK_BASE_ADDRESSES);
 const TOKEN_PRICE_FALLBACK_CHAIN_ID_SET = new Set(TOKEN_PRICE_FALLBACK_CHAIN_IDS);
+
+if (typeof BZR_ADDRESS === 'string' && BZR_ADDRESS) {
+  TOKEN_PRICE_FALLBACK_BASE_ADDRESS_SET.add(BZR_ADDRESS.toLowerCase());
+}
 const TRANSFERS_DEFAULT_CHAIN_ID = Number(process.env.TRANSFERS_DEFAULT_CHAIN_ID || 1);
 const TRANSFERS_DEFAULT_PAGE_SIZE = Number(process.env.TRANSFERS_DEFAULT_PAGE_SIZE || 25);
 const TRANSFERS_MAX_PAGE_SIZE = Number(process.env.TRANSFERS_MAX_PAGE_SIZE || 100);
@@ -1210,6 +1217,61 @@ const parsePositiveNumber = (value) => {
   return numeric;
 };
 
+const fetchTokenPriceFromCoingecko = async () => {
+  if (!TOKEN_PRICE_COINGECKO_ENABLED) {
+    const error = new Error('CoinGecko price source disabled');
+    error.code = 'COINGECKO_DISABLED';
+    throw error;
+  }
+
+  const endpoint = 'https://api.coingecko.com/api/v3/simple/price';
+  const params = {
+    ids: TOKEN_PRICE_COINGECKO_ID,
+    vs_currencies: 'usd',
+    include_last_updated_at: 'true',
+  };
+
+  try {
+    const response = await axios.get(endpoint, {
+      params,
+      timeout: TOKEN_PRICE_COINGECKO_TIMEOUT_MS,
+    });
+
+    const payload = response?.data || {};
+    const entry = payload?.[TOKEN_PRICE_COINGECKO_ID];
+    const usdRaw = entry?.usd;
+    const priceUsd = parsePositiveNumber(usdRaw);
+
+    if (!priceUsd || priceUsd <= 0) {
+      throw new Error('CoinGecko returned no USD price');
+    }
+
+    const lastUpdatedAt = Number(entry?.last_updated_at);
+    const timestamp = Number.isFinite(lastUpdatedAt) && lastUpdatedAt > 0
+      ? lastUpdatedAt * 1000
+      : Date.now();
+
+    return {
+      available: true,
+      priceUsd,
+      priceUsdRaw: typeof usdRaw === 'string' ? usdRaw : String(priceUsd),
+      source: `coingecko:${TOKEN_PRICE_COINGECKO_ID}`,
+      timestamp,
+      proRequired: false,
+      message: 'Price provided by CoinGecko',
+    };
+  } catch (error) {
+    if (error.response?.data) {
+      const wrapped = new Error(error.message || 'CoinGecko request failed');
+      wrapped.code = 'COINGECKO_HTTP_ERROR';
+      wrapped.payload = error.response.data;
+      throw wrapped;
+    }
+
+    throw error;
+  }
+};
+
 const fetchTokenPriceFromDexscreener = async () => {
   if (!TOKEN_PRICE_FALLBACK_ENABLED) {
     throw new Error('Token price fallback disabled');
@@ -1311,6 +1373,25 @@ const fetchTokenPriceFromDexscreener = async () => {
 };
 
 const fetchTokenPrice = async () => {
+  let coingeckoMessage = null;
+
+  if (TOKEN_PRICE_COINGECKO_ENABLED) {
+    try {
+      const coingeckoPayload = await fetchTokenPriceFromCoingecko();
+      if (
+        coingeckoPayload.available &&
+        typeof coingeckoPayload.priceUsd === 'number' &&
+        coingeckoPayload.priceUsd > 0
+      ) {
+        return coingeckoPayload;
+      }
+
+      coingeckoMessage = coingeckoPayload.message || 'CoinGecko returned no usable price data';
+    } catch (error) {
+      coingeckoMessage = error?.message || String(error);
+    }
+  }
+
   let primaryPayload = null;
   let primaryError = null;
 
@@ -1340,13 +1421,22 @@ const fetchTokenPrice = async () => {
         .filter(Boolean)
         .join(' · ');
     }
+    if (coingeckoMessage) {
+      fallbackPayload.message = [fallbackPayload.message, `CoinGecko fallback: ${coingeckoMessage}`]
+        .filter(Boolean)
+        .join(' · ');
+    }
     return fallbackPayload;
   } catch (fallbackError) {
     if (primaryPayload) {
       return {
         ...primaryPayload,
         available: primaryPayload.available && typeof primaryPayload.priceUsd === 'number' && primaryPayload.priceUsd > 0,
-        message: [primaryPayload.message, `Fallback failed: ${fallbackError.message || fallbackError}`]
+        message: [
+          primaryPayload.message,
+          coingeckoMessage ? `CoinGecko fallback: ${coingeckoMessage}` : null,
+          `Fallback failed: ${fallbackError.message || fallbackError}`,
+        ]
           .filter(Boolean)
           .join(' · '),
       };
@@ -1356,6 +1446,16 @@ const fetchTokenPrice = async () => {
       const aggregate = new Error('Unable to fetch token price from Etherscan and fallback provider');
       aggregate.cause = {
         primaryError: primaryError.message || primaryError,
+        fallbackError: fallbackError.message || fallbackError,
+        coingeckoError: coingeckoMessage,
+      };
+      throw aggregate;
+    }
+
+    if (coingeckoMessage) {
+      const aggregate = new Error('Unable to fetch token price from CoinGecko and fallback provider');
+      aggregate.cause = {
+        coingeckoError: coingeckoMessage,
         fallbackError: fallbackError.message || fallbackError,
       };
       throw aggregate;
