@@ -741,6 +741,162 @@ const triggerTransfersRefresh = ({ forceRefresh = false } = {}) => {
 };
 
 /**
+ * Handles aggregated transfers from all chains
+ */
+const handleAggregatedTransfers = async (req, res, options) => {
+  const {
+    forceRefresh,
+    requestedPage,
+    requestedPageSize,
+    sort,
+    startBlock,
+    endBlock,
+    includeTotals,
+  } = options;
+
+  console.log('-> Fetching aggregated transfers from all chains...');
+
+  try {
+    // Fetch first page from all chains in parallel
+    const results = await mapWithConcurrency(
+      CHAINS,
+      MAX_CONCURRENT_REQUESTS,
+      async (chain) => {
+        try {
+          const pageData = await resolveTransfersPageData({
+            chain,
+            page: 1,
+            pageSize: requestedPageSize,
+            sort,
+            startBlock,
+            endBlock,
+            forceRefresh,
+          });
+          return { chain, data: pageData, error: null };
+        } catch (error) {
+          console.warn(`! Failed to fetch transfers from ${chain.name}: ${error.message || error}`);
+          return { chain, data: null, error };
+        }
+      }
+    );
+
+    // Combine all transfers
+    const allTransfers = [];
+    const chainSummaries = [];
+    let totalCount = 0;
+
+    results.forEach((result) => {
+      if (result.status === 'fulfilled' && result.value.data) {
+        const { chain, data } = result.value;
+        allTransfers.push(...(data.transfers || []));
+        chainSummaries.push({
+          chainId: chain.id,
+          chainName: chain.name,
+          status: 'ok',
+          transferCount: (data.transfers || []).length,
+          durationMs: 0,
+          timestamp: data.timestamp || Date.now(),
+        });
+      } else if (result.status === 'fulfilled' && result.value.error) {
+        const { chain, error } = result.value;
+        chainSummaries.push({
+          chainId: chain.id,
+          chainName: chain.name,
+          status: 'error',
+          transferCount: 0,
+          error: error.message || String(error),
+          errorCode: error.code || null,
+          durationMs: 0,
+          timestamp: Date.now(),
+        });
+      }
+    });
+
+    // Sort all transfers by timestamp
+    allTransfers.sort((a, b) => {
+      const aTime = Number(a.timeStamp);
+      const bTime = Number(b.timeStamp);
+      return sort === 'asc' ? aTime - bTime : bTime - aTime;
+    });
+
+    // Paginate the combined results
+    const start = (requestedPage - 1) * requestedPageSize;
+    const end = start + requestedPageSize;
+    const paginatedTransfers = allTransfers.slice(start, end);
+    totalCount = allTransfers.length;
+
+    const totalPages = totalCount > 0 ? Math.ceil(totalCount / requestedPageSize) : 1;
+    const hasMore = totalCount > requestedPage * requestedPageSize;
+
+    const warmSummary = getCachedTransfersWarmSummary();
+    const warnings = [];
+
+    res.json({
+      data: paginatedTransfers,
+      pagination: {
+        page: requestedPage,
+        pageSize: requestedPageSize,
+        total: totalCount,
+        totalPages,
+        hasMore,
+        windowExceeded: false,
+        maxWindowPages: null,
+        resultWindow: null,
+      },
+      totals: includeTotals
+        ? {
+            total: totalCount,
+            truncated: false,
+            resultLength: totalCount,
+            timestamp: Date.now(),
+            stale: false,
+            source: 'aggregated',
+          }
+        : null,
+      chain: {
+        id: 0,
+        name: 'All Chains',
+      },
+      sort,
+      filters: {
+        startBlock: typeof startBlock === 'number' ? startBlock : null,
+        endBlock: typeof endBlock === 'number' ? endBlock : null,
+      },
+      timestamp: Date.now(),
+      stale: false,
+      source: 'aggregated',
+      warnings,
+      limits: {
+        maxPageSize: TRANSFERS_MAX_PAGE_SIZE,
+        totalFetchLimit: TRANSFERS_TOTAL_FETCH_LIMIT,
+        resultWindow: null,
+      },
+      defaults: {
+        chainId: 0,
+        pageSize: TRANSFERS_DEFAULT_PAGE_SIZE,
+        sort: 'desc',
+      },
+      warm: {
+        chains: warmSummary.chains,
+        timestamp: warmSummary.timestamp,
+      },
+      chains: chainSummaries,
+      availableChains: [{ id: 0, name: 'All Chains' }, ...CHAINS.map((c) => ({ id: c.id, name: c.name }))],
+      request: {
+        forceRefresh,
+        includeTotals,
+      },
+    });
+  } catch (error) {
+    console.error('Error handling aggregated transfers request:', error.message || error);
+    return res.status(500).json({
+      message: 'Failed to fetch aggregated transfers',
+      error: error.message || String(error),
+    });
+  }
+};
+
+/**
  * [Milestone 2.2]
  * Fetches ERC-20 token transfers for a single chain.
  * @param {object} chain - A chain object { id, name }
@@ -795,7 +951,13 @@ const fetchTransfersPageFromChain = async ({ chain, page, pageSize, sort, startB
       };
     }
 
-    if (payload.status === '0') {
+    if (payload.status === '0' || String(payload?.message || '').toUpperCase() === 'NOTOK') {
+      const errorMessage = payload?.message || payload?.result || '';
+      const errorString = String(errorMessage);
+
+      // Log the full error for debugging
+      console.warn(`! Etherscan API error for ${chain.name}:`, errorString, 'Full payload:', JSON.stringify(payload));
+
       if (isProOnlyResponse(payload)) {
         const error = new Error(payload?.result || payload?.message || 'Etherscan PRO plan required');
         error.code = 'ETHERSCAN_PRO_ONLY';
@@ -803,8 +965,8 @@ const fetchTransfersPageFromChain = async ({ chain, page, pageSize, sort, startB
         throw error;
       }
 
-      const noRecordsMessage = String(payload?.message || payload?.result || '').toLowerCase();
-      if (noRecordsMessage.includes('no transactions')) {
+      const noRecordsMessage = errorString.toLowerCase();
+      if (noRecordsMessage.includes('no transactions') || noRecordsMessage.includes('no records found')) {
         return {
           transfers: [],
           upstream: payload,
@@ -818,7 +980,7 @@ const fetchTransfersPageFromChain = async ({ chain, page, pageSize, sort, startB
         };
       }
 
-      const error = new Error(payload?.message || payload?.result || 'Failed to fetch token transfers');
+      const error = new Error(errorString || 'Failed to fetch token transfers');
       error.code = 'ETHERSCAN_ERROR';
       error.payload = payload;
       throw error;
@@ -888,7 +1050,13 @@ const fetchTransfersTotalCount = async ({ chain, sort, startBlock, endBlock }) =
       };
     }
 
-    if (payload.status === '0') {
+    if (payload.status === '0' || String(payload?.message || '').toUpperCase() === 'NOTOK') {
+      const errorMessage = payload?.message || payload?.result || '';
+      const errorString = String(errorMessage);
+
+      // Log the full error for debugging
+      console.warn(`! Etherscan API error for ${chain.name} (totals):`, errorString, 'Full payload:', JSON.stringify(payload));
+
       if (isProOnlyResponse(payload)) {
         const error = new Error(payload?.result || payload?.message || 'Etherscan PRO plan required');
         error.code = 'ETHERSCAN_PRO_ONLY';
@@ -1679,7 +1847,7 @@ app.get('/api/transfers', async (req, res) => {
   }
 
   const forceRefresh = String(req.query.force).toLowerCase() === 'true';
-  const requestedChainId = Number(req.query.chainId || TRANSFERS_DEFAULT_CHAIN_ID);
+  const requestedChainId = Number(req.query.chainId || 0);
   const requestedPage = normalizePageNumber(req.query.page || 1);
   const requestedPageSize = clampTransfersPageSize(req.query.pageSize || TRANSFERS_DEFAULT_PAGE_SIZE);
   const sortParam = typeof req.query.sort === 'string' ? req.query.sort.toLowerCase() : 'desc';
@@ -1693,6 +1861,21 @@ app.get('/api/transfers', async (req, res) => {
       message: 'startBlock cannot be greater than endBlock',
       startBlock,
       endBlock,
+    });
+  }
+
+  // Special handling for "All Chains" aggregation (chainId = 0)
+  const isAggregatedView = requestedChainId === 0;
+
+  if (isAggregatedView) {
+    return handleAggregatedTransfers(req, res, {
+      forceRefresh,
+      requestedPage,
+      requestedPageSize,
+      sort,
+      startBlock,
+      endBlock,
+      includeTotals,
     });
   }
 
