@@ -71,7 +71,23 @@ const strictLimiter = rateLimit({
 app.use('/api/', apiLimiter);
 
 // --- Constants ---
-const ETHERSCAN_API_KEY = process.env.ETHERSCAN_V2_API_KEY;
+// Support multiple API keys for load balancing
+const API_KEYS_RAW = process.env.ETHERSCAN_V2_API_KEY || '';
+const ETHERSCAN_API_KEYS = API_KEYS_RAW.includes(',') 
+  ? API_KEYS_RAW.split(',').map(k => k.trim()).filter(k => k.length > 0)
+  : [API_KEYS_RAW];
+const ETHERSCAN_API_KEY = ETHERSCAN_API_KEYS[0]; // Fallback for single key usage
+let currentKeyIndex = 0;
+
+// Function to get next API key (round-robin)
+const getNextApiKey = () => {
+  const key = ETHERSCAN_API_KEYS[currentKeyIndex];
+  currentKeyIndex = (currentKeyIndex + 1) % ETHERSCAN_API_KEYS.length;
+  return key;
+};
+
+console.log(`i Loaded ${ETHERSCAN_API_KEYS.length} Etherscan API key(s) for load balancing`);
+
 const BZR_ADDRESS = process.env.BZR_TOKEN_ADDRESS;
 const API_V2_BASE_URL = 'https://api.etherscan.io/v2/api';
 const CRONOS_API_KEY = process.env.CRONOS_API_KEY;
@@ -169,7 +185,12 @@ const buildProviderRequest = (chain, params = {}, options = {}) => {
   const nextParams = { ...params };
 
   if (includeApiKey) {
-    nextParams.apikey = provider.apiKey;
+    // Use rotating API key for etherscan provider
+    if (provider.key === 'etherscan') {
+      nextParams.apikey = getNextApiKey();
+    } else {
+      nextParams.apikey = provider.apiKey;
+    }
   }
 
   if (provider.requiresChainId) {
@@ -1517,7 +1538,7 @@ const fetchStatsForChain = async (chain) => {
 const fetchTokenPriceFromEtherscan = async () => {
   const params = {
     chainid: 1,
-    apikey: ETHERSCAN_API_KEY,
+    apikey: getNextApiKey(),
     module: 'token',
     action: 'tokeninfo',
     contractaddress: BZR_ADDRESS,
@@ -1850,7 +1871,7 @@ const parseFinalizedBlockPayload = (result, source) => {
 const fetchFinalizedBlockFromEtherscan = async () => {
   const params = {
     chainid: 1,
-    apikey: ETHERSCAN_API_KEY,
+    apikey: getNextApiKey(),
     module: 'proxy',
     action: 'eth_getBlockByNumber',
     tag: 'finalized',
@@ -1947,7 +1968,7 @@ app.get('/api/info', strictLimiter, cacheMiddleware(300), async (req, res) => {
   // We only need to get this info from one chain, so we'll use Ethereum (chainid=1)
   const params = {
     chainid: 1, // Ethereum Mainnet
-    apikey: ETHERSCAN_API_KEY,
+    apikey: getNextApiKey(),
   };
 
   // We will make three API calls in parallel to get all the info we need
