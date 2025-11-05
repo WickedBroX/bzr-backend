@@ -2354,6 +2354,15 @@ app.get('/api/stats', async (req, res) => {
     };
 
     console.log(`-> Aggregated stats. Total holders (estimated): ${totalHolders}.`);
+    
+    // If we got 0 or suspiciously low holders and we have cached data, keep the cache
+    if (totalHolders < 100 && cache.stats && cache.stats.totalHolders > totalHolders) {
+      console.warn(`! Stats returned ${totalHolders} holders but cache has ${cache.stats.totalHolders}. Keeping cached data due to likely API failures.`);
+      // Extend cache time by 2 more minutes to avoid hammering failing APIs
+      cache.statsTimestamp = Date.now();
+      return res.json(cache.stats);
+    }
+    
     cache.stats = response;
     cache.statsTimestamp = Date.now();
     res.json(response);
