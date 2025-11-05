@@ -5,6 +5,7 @@ const { Pool } = require('pg');
 const DEFAULT_MAX_CLIENTS = Number(process.env.TRANSFERS_DB_MAX_CLIENTS || process.env.DB_MAX_CLIENTS || 10);
 const DEFAULT_IDLE_TIMEOUT_MS = Number(process.env.TRANSFERS_DB_IDLE_TIMEOUT_MS || 30_000);
 const DEFAULT_CONNECTION_TIMEOUT_MS = Number(process.env.TRANSFERS_DB_CONNECTION_TIMEOUT_MS || 5_000);
+const DEFAULT_STALE_THRESHOLD_SECONDS = Number(process.env.TRANSFERS_STALE_THRESHOLD_SECONDS || 900);
 
 let pool = null;
 let storeEnabled = false;
@@ -153,6 +154,47 @@ const runMigrations = async (clientPool) => {
       );
     `);
 
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS transfer_chain_totals (
+        chain_id INTEGER PRIMARY KEY,
+        total_transfers BIGINT NOT NULL DEFAULT 0,
+        total_volume_raw NUMERIC(78, 0) NOT NULL DEFAULT 0,
+        first_time TIMESTAMPTZ,
+        last_time TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    await client.query('CREATE INDEX IF NOT EXISTS idx_transfer_chain_totals_updated_at ON transfer_chain_totals (updated_at DESC);');
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS transfer_daily_aggregates (
+        chain_id INTEGER NOT NULL,
+        day DATE NOT NULL,
+        transfer_count INTEGER NOT NULL DEFAULT 0,
+        volume_raw NUMERIC(78, 0) NOT NULL DEFAULT 0,
+        unique_addresses INTEGER NOT NULL DEFAULT 0,
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (chain_id, day)
+      );
+    `);
+
+    await client.query('CREATE INDEX IF NOT EXISTS idx_transfer_daily_aggregates_day ON transfer_daily_aggregates (day DESC);');
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS transfer_ingest_status (
+        chain_id INTEGER PRIMARY KEY,
+        ready BOOLEAN NOT NULL DEFAULT FALSE,
+        last_success_at TIMESTAMPTZ,
+        last_error_at TIMESTAMPTZ,
+        last_error TEXT,
+        consecutive_failures INTEGER NOT NULL DEFAULT 0,
+        backoff_until TIMESTAMPTZ,
+        meta JSONB,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');
@@ -178,6 +220,20 @@ const withClient = async (task) => {
   } finally {
     client.release();
   }
+};
+
+const normalizeChainIds = (chainId) => {
+  if (Array.isArray(chainId)) {
+    return chainId
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value));
+  }
+
+  if (typeof chainId === 'number' && Number.isFinite(chainId)) {
+    return [chainId];
+  }
+
+  return [];
 };
 
 const normalizeTransferRecord = (chainId, transfer) => {
@@ -299,6 +355,349 @@ const recordIngestEvent = async (chainId, status, message, meta = null) => {
     `,
     [chainId, status, message || null, meta]
   ));
+};
+
+const refreshChainTotals = async (chainId) => {
+  if (!storeEnabled || !storeReady) {
+    return null;
+  }
+
+  const result = await withClient((client) => client.query(
+    `
+      WITH stats AS (
+        SELECT
+          COUNT(*)::BIGINT AS total_transfers,
+          COALESCE(SUM(value::numeric), 0::NUMERIC) AS total_volume_raw,
+          MIN(time_stamp) AS first_time,
+          MAX(time_stamp) AS last_time
+        FROM transfer_events
+        WHERE chain_id = $1
+      )
+      INSERT INTO transfer_chain_totals (
+        chain_id,
+        total_transfers,
+        total_volume_raw,
+        first_time,
+        last_time,
+        updated_at
+      )
+      SELECT
+        $1,
+        stats.total_transfers,
+        stats.total_volume_raw,
+        stats.first_time,
+        stats.last_time,
+        NOW()
+      FROM stats
+      ON CONFLICT (chain_id) DO UPDATE SET
+        total_transfers = EXCLUDED.total_transfers,
+        total_volume_raw = EXCLUDED.total_volume_raw,
+        first_time = EXCLUDED.first_time,
+        last_time = EXCLUDED.last_time,
+        updated_at = NOW()
+      RETURNING chain_id, total_transfers, total_volume_raw, first_time, last_time, updated_at;
+    `,
+    [chainId]
+  ));
+
+  const row = result.rows[0];
+  if (!row) {
+    return null;
+  }
+
+  return {
+    chainId: row.chain_id,
+    totalTransfers: Number.parseInt(row.total_transfers, 10) || 0,
+    totalVolumeRaw: row.total_volume_raw ? String(row.total_volume_raw) : '0',
+    firstTime: row.first_time ? new Date(row.first_time) : null,
+    lastTime: row.last_time ? new Date(row.last_time) : null,
+    updatedAt: row.updated_at ? new Date(row.updated_at) : new Date(),
+  };
+};
+
+const refreshChainDailyAggregates = async (chainId, options = {}) => {
+  if (!storeEnabled || !storeReady) {
+    return { upserted: 0 };
+  }
+
+  const normalizedStart = normalizeDateInput(options.startTime);
+  const normalizedEnd = normalizeDateInput(options.endTime);
+
+  const params = [chainId];
+  const filters = ['chain_id = $1'];
+
+  if (normalizedStart) {
+    params.push(normalizedStart);
+    filters.push(`time_stamp >= $${params.length}`);
+  }
+
+  if (normalizedEnd) {
+    params.push(normalizedEnd);
+    filters.push(`time_stamp <= $${params.length}`);
+  }
+
+  const clause = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+
+  const result = await withClient((client) => client.query(
+    `
+      WITH filtered AS (
+        SELECT *
+        FROM transfer_events
+        ${clause}
+      ),
+      daily AS (
+        SELECT
+          DATE_TRUNC('day', time_stamp)::DATE AS day,
+          COUNT(*)::BIGINT AS transfer_count,
+          COALESCE(SUM(value::numeric), 0::NUMERIC) AS volume_raw
+        FROM filtered
+        GROUP BY day
+      ),
+      participants AS (
+        SELECT DATE_TRUNC('day', time_stamp)::DATE AS day, from_address AS address FROM filtered
+        UNION
+        SELECT DATE_TRUNC('day', time_stamp)::DATE AS day, to_address AS address FROM filtered
+      ),
+      daily_participants AS (
+        SELECT day, COUNT(DISTINCT address) AS unique_addresses
+        FROM participants
+        GROUP BY day
+      )
+      INSERT INTO transfer_daily_aggregates (
+        chain_id,
+        day,
+        transfer_count,
+        volume_raw,
+        unique_addresses,
+        updated_at
+      )
+      SELECT
+        $1,
+        daily.day,
+        daily.transfer_count,
+        daily.volume_raw,
+        COALESCE(daily_participants.unique_addresses, 0),
+        NOW()
+      FROM daily
+      LEFT JOIN daily_participants ON daily_participants.day = daily.day
+      ON CONFLICT (chain_id, day) DO UPDATE SET
+        transfer_count = EXCLUDED.transfer_count,
+        volume_raw = EXCLUDED.volume_raw,
+        unique_addresses = EXCLUDED.unique_addresses,
+        updated_at = NOW();
+    `,
+    params
+  ));
+
+  return { upserted: result.rowCount || 0 };
+};
+
+const refreshChainAggregates = async (chainId, options = {}) => {
+  if (!storeEnabled || !storeReady) {
+    return null;
+  }
+
+  const totals = await refreshChainTotals(chainId);
+  await refreshChainDailyAggregates(chainId, options);
+  return totals;
+};
+
+const recordIngestStatusSuccess = async (chainId, { ready = false, meta = null } = {}) => {
+  if (!storeEnabled || !storeReady) {
+    return;
+  }
+
+  await withClient((client) => client.query(
+    `
+      INSERT INTO transfer_ingest_status (
+        chain_id,
+        ready,
+        last_success_at,
+        last_error_at,
+        last_error,
+        consecutive_failures,
+        backoff_until,
+        meta,
+        updated_at
+      )
+      VALUES ($1, $2, NOW(), NULL, NULL, 0, NULL, $3, NOW())
+      ON CONFLICT (chain_id) DO UPDATE SET
+        ready = EXCLUDED.ready,
+        last_success_at = NOW(),
+        last_error_at = NULL,
+        last_error = NULL,
+        consecutive_failures = 0,
+        backoff_until = NULL,
+        meta = COALESCE(EXCLUDED.meta, transfer_ingest_status.meta),
+        updated_at = NOW();
+    `,
+    [chainId, ready, meta]
+  ));
+};
+
+const recordIngestStatusFailure = async (chainId, error, { failureCount = 1, backoffUntil = null, meta = null } = {}) => {
+  if (!storeEnabled || !storeReady) {
+    return;
+  }
+
+  const message = error && error.message ? String(error.message).slice(0, 500) : String(error || 'Unknown error');
+  const failureMeta = meta || { error: message };
+
+  await withClient((client) => client.query(
+    `
+      INSERT INTO transfer_ingest_status (
+        chain_id,
+        ready,
+        last_success_at,
+        last_error_at,
+        last_error,
+        consecutive_failures,
+        backoff_until,
+        meta,
+        updated_at
+      )
+      VALUES ($1, FALSE, NULL, NOW(), $2, $3, $4, $5, NOW())
+      ON CONFLICT (chain_id) DO UPDATE SET
+        ready = transfer_ingest_status.ready,
+        last_error_at = NOW(),
+        last_error = $2,
+        consecutive_failures = $3,
+        backoff_until = $4,
+        meta = COALESCE(transfer_ingest_status.meta, '{}'::JSONB) || COALESCE($5::JSONB, '{}'::JSONB),
+        updated_at = NOW();
+    `,
+    [chainId, message, failureCount, backoffUntil, failureMeta]
+  ));
+};
+
+const getChainSnapshots = async (chainId) => {
+  if (!storeEnabled || !storeReady) {
+    return [];
+  }
+
+  const chainIds = normalizeChainIds(chainId);
+  if (!chainIds.length) {
+    return [];
+  }
+
+  const result = await withClient((client) => client.query(
+    `
+      WITH requested AS (
+        SELECT UNNEST($1::INT[]) AS chain_id
+      )
+      SELECT
+        requested.chain_id,
+        totals.total_transfers,
+        totals.total_volume_raw,
+        totals.first_time,
+        totals.last_time,
+        totals.updated_at AS totals_updated_at,
+        status.ready,
+        status.last_success_at,
+        status.last_error_at,
+        status.last_error,
+        status.consecutive_failures,
+        status.backoff_until,
+        status.meta,
+        cursor.last_time AS cursor_last_time,
+        cursor.updated_at AS cursor_updated_at
+      FROM requested
+      LEFT JOIN transfer_chain_totals totals ON totals.chain_id = requested.chain_id
+      LEFT JOIN transfer_ingest_status status ON status.chain_id = requested.chain_id
+      LEFT JOIN transfer_ingest_cursors cursor ON cursor.chain_id = requested.chain_id;
+    `,
+    [chainIds]
+  ));
+
+  const now = Date.now();
+
+  return result.rows.map((row) => {
+    const totalTransfers = Number.parseInt(row.total_transfers, 10) || 0;
+    const lastTime = row.last_time ? new Date(row.last_time) : null;
+    const cursorTime = row.cursor_last_time ? new Date(row.cursor_last_time) : null;
+    const referenceTime = lastTime || cursorTime;
+    const indexLagSeconds = referenceTime ? Math.max(0, Math.floor((now - referenceTime.getTime()) / 1000)) : null;
+    const ready = Boolean(row.ready) || totalTransfers > 0;
+    const stale = typeof indexLagSeconds === 'number' ? indexLagSeconds > DEFAULT_STALE_THRESHOLD_SECONDS : false;
+
+    return {
+      chainId: Number.parseInt(row.chain_id, 10) || 0,
+      totals: {
+        totalTransfers,
+        totalVolumeRaw: row.total_volume_raw ? String(row.total_volume_raw) : '0',
+        firstTime: row.first_time ? new Date(row.first_time) : null,
+        lastTime,
+        updatedAt: row.totals_updated_at ? new Date(row.totals_updated_at) : null,
+      },
+      status: {
+        ready,
+        stale,
+        lastSuccessAt: row.last_success_at ? new Date(row.last_success_at) : null,
+        lastErrorAt: row.last_error_at ? new Date(row.last_error_at) : null,
+        lastError: row.last_error || null,
+        consecutiveFailures: Number.parseInt(row.consecutive_failures, 10) || 0,
+        backoffUntil: row.backoff_until ? new Date(row.backoff_until) : null,
+        indexLagSeconds,
+        cursorUpdatedAt: row.cursor_updated_at ? new Date(row.cursor_updated_at) : null,
+        cursorTime,
+        meta: row.meta || null,
+      },
+    };
+  });
+};
+
+const getDailyAggregates = async ({ chainId, startDate, endDate }) => {
+  if (!storeEnabled || !storeReady) {
+    return [];
+  }
+
+  const chainIds = normalizeChainIds(chainId);
+  if (!chainIds.length) {
+    return [];
+  }
+
+  const normalizedStart = normalizeDateInput(startDate);
+  const normalizedEnd = normalizeDateInput(endDate);
+
+  const params = [chainIds];
+  const filters = ['chain_id = ANY($1::INT[])'];
+
+  if (normalizedStart) {
+    params.push(normalizedStart);
+    filters.push(`day >= $${params.length}::DATE`);
+  }
+
+  if (normalizedEnd) {
+    params.push(normalizedEnd);
+    filters.push(`day <= $${params.length}::DATE`);
+  }
+
+  const clause = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+
+  const result = await withClient((client) => client.query(
+    `
+      SELECT
+        chain_id,
+        day,
+        transfer_count,
+        volume_raw,
+        unique_addresses,
+        updated_at
+      FROM transfer_daily_aggregates
+      ${clause}
+      ORDER BY chain_id ASC, day ASC;
+    `,
+    params
+  ));
+
+  return result.rows.map((row) => ({
+    chainId: Number.parseInt(row.chain_id, 10) || 0,
+    day: row.day ? new Date(row.day) : null,
+    transferCount: Number.parseInt(row.transfer_count, 10) || 0,
+    volumeRaw: row.volume_raw ? String(row.volume_raw) : '0',
+    uniqueAddresses: Number.parseInt(row.unique_addresses, 10) || 0,
+    updatedAt: row.updated_at ? new Date(row.updated_at) : null,
+  }));
 };
 
 const getIngestCursor = async (chainId) => {
@@ -775,8 +1174,15 @@ module.exports = {
   storeTransfers,
   updateIngestCursor,
   recordIngestEvent,
+  refreshChainTotals,
+  refreshChainDailyAggregates,
+  refreshChainAggregates,
+  recordIngestStatusSuccess,
+  recordIngestStatusFailure,
   getIngestCursor,
   getLatestIngestSummary,
+  getChainSnapshots,
+  getDailyAggregates,
   queryTransfersPage,
   countTransfers,
   getMaxTimestamp,

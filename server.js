@@ -17,10 +17,10 @@ const {
   computeAnomalies,
   TIME_RANGE_TO_DAYS,
 } = require('./src/analyticsService');
-const { startTransferIngestion } = require('./src/transfersIngestion');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const SERVER_START_TIME = Date.now();
 
 // --- Cache Setup ---
 const apiCache = new NodeCache({ stdTTL: 60, checkperiod: 120 }); // Default 60s TTL for new caching
@@ -281,7 +281,6 @@ const cache = {
   finalityTimestamp: 0,
 };
 
-let transferIngestionController = null;
 let persistentStoreReady = false;
 let persistentStoreInitError = null;
 
@@ -325,9 +324,7 @@ const TRANSFERS_MAX_PAGE_SIZE = Number(process.env.TRANSFERS_MAX_PAGE_SIZE || 10
 const TRANSFERS_PAGE_TTL_MS = Number(process.env.TRANSFERS_PAGE_TTL_MS || TWO_MINUTES);
 const TRANSFERS_TOTAL_TTL_MS = Number(process.env.TRANSFERS_TOTAL_TTL_MS || 15 * 60 * 1000);
 const TRANSFERS_TOTAL_FETCH_LIMIT = Number(process.env.TRANSFERS_TOTAL_FETCH_LIMIT || 25_000);
-const TRANSFERS_DATA_SOURCE = (process.env.TRANSFERS_DATA_SOURCE || 'upstream').toLowerCase();
-const USE_PERSISTENT_TRANSFERS = TRANSFERS_DATA_SOURCE === 'persistent';
-const PERSISTENT_STORE_BOOTSTRAP_TIMEOUT_MS = Number(process.env.PERSISTENT_STORE_BOOTSTRAP_TIMEOUT_MS || 15_000);
+const TRANSFERS_DATA_SOURCE = (process.env.TRANSFERS_DATA_SOURCE || 'store').toLowerCase();
 const ETHERSCAN_RESULT_WINDOW = Number(process.env.ETHERSCAN_RESULT_WINDOW || 10_000);
 
 const toNumericTimestamp = (timestamp) => {
@@ -1686,6 +1683,35 @@ const handleAggregatedTransfers = async (req, res, options) => {
   }
 };
 
+const INGEST_STALE_THRESHOLD_SECONDS = Number(process.env.TRANSFERS_STALE_THRESHOLD_SECONDS || 900);
+
+const normalizeChainSnapshots = (snapshots = []) => {
+  return snapshots.map((snapshot) => {
+    const chainDef = getChainDefinition(snapshot.chainId);
+    const indexLag = typeof snapshot.status.indexLagSeconds === 'number' ? snapshot.status.indexLagSeconds : null;
+    const stale = typeof indexLag === 'number' ? indexLag > INGEST_STALE_THRESHOLD_SECONDS : !snapshot.status.ready;
+
+    return {
+      chainId: snapshot.chainId,
+      chainName: chainDef?.name || `Chain ${snapshot.chainId}`,
+      ready: Boolean(snapshot.status.ready),
+      stale,
+      indexLagSeconds: indexLag,
+      totalTransfers: snapshot.totals?.totalTransfers || 0,
+      totalVolumeRaw: snapshot.totals?.totalVolumeRaw || '0',
+      firstTime: snapshot.totals?.firstTime ? snapshot.totals.firstTime.toISOString() : null,
+      lastTime: snapshot.totals?.lastTime ? snapshot.totals.lastTime.toISOString() : null,
+      updatedAt: snapshot.totals?.updatedAt ? snapshot.totals.updatedAt.toISOString() : null,
+      lastSuccessAt: snapshot.status.lastSuccessAt ? snapshot.status.lastSuccessAt.toISOString() : null,
+      lastErrorAt: snapshot.status.lastErrorAt ? snapshot.status.lastErrorAt.toISOString() : null,
+      lastError: snapshot.status.lastError || null,
+      consecutiveFailures: snapshot.status.consecutiveFailures,
+      backoffUntil: snapshot.status.backoffUntil ? snapshot.status.backoffUntil.toISOString() : null,
+      meta: snapshot.status.meta || null,
+    };
+  });
+};
+
 const handlePersistentTransfers = async (req, res, options) => {
   const {
     requestedChainId,
@@ -1697,74 +1723,388 @@ const handlePersistentTransfers = async (req, res, options) => {
     includeTotals,
   } = options;
 
-  if (!persistentStoreReady || !persistentStore.isPersistentStoreReady()) {
-    const reason = persistentStoreInitError ? persistentStoreInitError.message : 'Persistent store not ready';
-    return res.status(503).json({
-      message: 'Persistent transfers store not ready',
+  const storeReady = persistentStoreReady && persistentStore.isPersistentStoreReady();
+  const warnings = [];
+
+  if (requestedChainId !== 0 && !getChainDefinition(requestedChainId)) {
+    return res.status(400).json({
+      message: 'Unsupported chain requested',
+      chainId: requestedChainId,
+      availableChains: CHAINS.map((chain) => ({ id: chain.id, name: chain.name })),
+    });
+  }
+
+  const chainIds = requestedChainId === 0
+    ? CHAINS.map((chain) => chain.id)
+    : [requestedChainId];
+
+  let pageData = {
+    transfers: [],
+    resultLength: 0,
+    timestamp: Date.now(),
+    source: 'store',
+  };
+  let totalCount = 0;
+  let lastTime = null;
+  let lagSeconds = null;
+  let queryError = null;
+
+  if (!storeReady) {
+    warnings.push({
+      scope: 'store',
+      code: 'STORE_NOT_READY',
+      message: 'Transfer snapshots are still initializing; returning current persisted data.',
+      retryable: true,
+    });
+  }
+
+  if (storeReady) {
+    try {
+      pageData = await persistentStore.queryTransfersPage({
+        chainId: chainIds,
+        page: requestedPage,
+        pageSize: requestedPageSize,
+        sort,
+        startBlock,
+        endBlock,
+      });
+    } catch (error) {
+      queryError = error;
+      warnings.push({
+        scope: 'store',
+        code: 'STORE_PAGE_READ_FAILED',
+        message: error.message || 'Failed to read transfer page from store. Returning cached snapshot.',
+        retryable: true,
+      });
+    }
+  }
+
+  if (storeReady && includeTotals) {
+    try {
+      totalCount = await persistentStore.countTransfers({ chainId: chainIds, startBlock, endBlock });
+    } catch (error) {
+      warnings.push({
+        scope: 'store',
+        code: 'STORE_TOTALS_FAILED',
+        message: error.message || 'Failed to compute transfer totals; pagination totals may be incomplete.',
+        retryable: true,
+      });
+      totalCount = pageData.resultLength || 0;
+    }
+  } else {
+    totalCount = pageData.resultLength || 0;
+  }
+
+  if (storeReady) {
+    try {
+      const freshness = await persistentStore.getMaxTimestamp({ chainId: chainIds });
+      lastTime = freshness.lastTime || null;
+      lagSeconds = typeof freshness.lagSeconds === 'number' ? freshness.lagSeconds : null;
+    } catch (error) {
+      warnings.push({
+        scope: 'store',
+        code: 'STORE_FRESHNESS_FAILED',
+        message: error.message || 'Failed to compute transfer freshness metrics.',
+        retryable: true,
+      });
+    }
+  }
+
+  let rawSnapshots = [];
+  if (storeReady) {
+    try {
+      rawSnapshots = await persistentStore.getChainSnapshots(chainIds);
+    } catch (error) {
+      warnings.push({
+        scope: 'store',
+        code: 'STORE_SNAPSHOT_FAILED',
+        message: error.message || 'Failed to load chain snapshots metadata.',
+        retryable: true,
+      });
+    }
+  }
+
+  const normalizedSnapshots = normalizeChainSnapshots(rawSnapshots);
+
+  const snapshotTotals = normalizedSnapshots.reduce((acc, snapshot) => acc + (snapshot.totalTransfers || 0), 0);
+  const metaTotal = includeTotals ? (Number.isFinite(totalCount) ? totalCount : snapshotTotals) : (snapshotTotals || totalCount);
+  const metaIndexLag = normalizedSnapshots.reduce((max, snapshot) => {
+    if (typeof snapshot.indexLagSeconds === 'number') {
+      return max === null ? snapshot.indexLagSeconds : Math.max(max, snapshot.indexLagSeconds);
+    }
+    return max;
+  }, lagSeconds !== null ? lagSeconds : null);
+  const metaReady = Boolean(storeReady) && normalizedSnapshots.length > 0
+    ? normalizedSnapshots.every((snapshot) => snapshot.ready)
+    : Boolean(storeReady) && !queryError;
+  const metaStale = typeof metaIndexLag === 'number'
+    ? metaIndexLag > INGEST_STALE_THRESHOLD_SECONDS
+    : !metaReady;
+
+  if (!metaReady) {
+    warnings.push({
+      scope: 'store',
+      code: 'STORE_DATA_NOT_READY',
+      message: 'Transfer snapshots are still preparing; data may be partial.',
+      retryable: true,
+    });
+  }
+
+  if (metaStale) {
+    warnings.push({
+      scope: 'store',
+      code: 'STORE_DATA_STALE',
+      message: 'Latest transfer data is stale. Serving last successful snapshot.',
+      retryable: false,
+    });
+  }
+
+  if (queryError) {
+    warnings.push({
+      scope: 'store',
+      code: 'STORE_PAGE_FALLBACK',
+      message: 'Recent ingestion failure detected. Showing previously stored transfers.',
+      retryable: true,
+    });
+  }
+
+  const totalPages = metaTotal > 0
+    ? Math.max(1, Math.ceil(metaTotal / requestedPageSize))
+    : (Array.isArray(pageData.transfers) && pageData.transfers.length === requestedPageSize ? requestedPage + 1 : requestedPage);
+
+  let hasMore = metaTotal > requestedPage * requestedPageSize;
+  if (!metaReady && metaTotal === 0) {
+    hasMore = false;
+  }
+
+  const chainMeta = requestedChainId === 0
+    ? { id: 0, name: 'All Chains' }
+    : (() => {
+        const chain = getChainDefinition(requestedChainId);
+        return chain ? { id: chain.id, name: chain.name } : { id: requestedChainId, name: `Chain ${requestedChainId}` };
+      })();
+
+  const timestamp = pageData.timestamp || Date.now();
+
+  const meta = {
+    ready: metaReady,
+    total: metaTotal,
+    indexLagSec: typeof metaIndexLag === 'number' ? metaIndexLag : null,
+    stale: metaStale,
+    storeReady,
+  };
+
+  const totalsPayload = includeTotals
+    ? {
+        total: metaTotal,
+        truncated: false,
+        resultLength: metaTotal,
+        timestamp,
+        stale: metaStale,
+        source: 'store',
+      }
+    : null;
+
+  res.json({
+    data: Array.isArray(pageData.transfers) ? pageData.transfers : [],
+    pagination: {
+      page: requestedPage,
+      pageSize: requestedPageSize,
+      total: metaTotal,
+      totalPages,
+      hasMore,
+      windowExceeded: false,
+      maxWindowPages: null,
+      resultWindow: null,
+    },
+    totals: totalsPayload,
+    chain: chainMeta,
+    sort,
+    filters: {
+      startBlock: typeof startBlock === 'number' ? startBlock : null,
+      endBlock: typeof endBlock === 'number' ? endBlock : null,
+    },
+    timestamp,
+    stale: metaStale,
+    source: 'store',
+    warnings,
+    limits: {
+      maxPageSize: TRANSFERS_MAX_PAGE_SIZE,
+      totalFetchLimit: TRANSFERS_TOTAL_FETCH_LIMIT,
+      resultWindow: null,
+    },
+    defaults: {
+      chainId: TRANSFERS_DEFAULT_CHAIN_ID,
+      pageSize: TRANSFERS_DEFAULT_PAGE_SIZE,
+      sort: 'desc',
+    },
+    warm: {
+      chains: normalizedSnapshots,
+      timestamp,
       source: 'store',
-      reason,
+    },
+    chains: normalizedSnapshots,
+    availableChains: [{ id: 0, name: 'All Chains' }, ...CHAINS.map((c) => ({ id: c.id, name: c.name }))],
+    freshness: {
+      lastIngestedAt: lastTime ? lastTime.toISOString() : null,
+      ingestLagSeconds: typeof lagSeconds === 'number' ? lagSeconds : meta.indexLagSec,
+      status: metaStale ? 'stale' : 'fresh',
+    },
+    snapshots: normalizedSnapshots,
+    meta,
+    request: {
+      includeTotals,
+      dataSource: 'store',
+      storeReady,
+    },
+  });
+};
+
+const handleUpstreamTransfers = async (req, res, options) => {
+  const {
+    forceRefresh,
+    requestedChainId,
+    requestedPage,
+    requestedPageSize,
+    sort,
+    startBlock,
+    endBlock,
+    includeTotals,
+  } = options;
+
+  const chain = getChainDefinition(requestedChainId) || getChainDefinition(TRANSFERS_DEFAULT_CHAIN_ID) || CHAINS[0];
+  if (!chain) {
+    return res.status(400).json({
+      message: 'Unsupported chain requested',
+      chainId: requestedChainId,
+      availableChains: CHAINS,
     });
   }
 
   try {
-    if (requestedChainId !== 0 && !getChainDefinition(requestedChainId)) {
-      return res.status(400).json({
-        message: 'Unsupported chain requested',
-        chainId: requestedChainId,
-        availableChains: CHAINS.map((chain) => ({ id: chain.id, name: chain.name })),
+    getProviderConfigForChain(chain);
+  } catch (providerError) {
+    return res.status(500).json({ message: providerError.message });
+  }
+
+  const chainIsCronos = getProviderKeyForChain(chain) === 'cronos';
+  const resultWindowLimit = !chainIsCronos && Number.isFinite(ETHERSCAN_RESULT_WINDOW)
+    ? Math.max(0, ETHERSCAN_RESULT_WINDOW)
+    : null;
+  const maxWindowPagesForRequest = resultWindowLimit
+    ? Math.max(1, Math.floor(resultWindowLimit / requestedPageSize) || 1)
+    : null;
+  const requestExceedsWindow = Boolean(resultWindowLimit && requestedPage > maxWindowPagesForRequest);
+
+  try {
+    const pagePromise = requestExceedsWindow
+      ? Promise.resolve({
+          transfers: [],
+          upstream: null,
+          timestamp: Date.now(),
+          page: requestedPage,
+          pageSize: requestedPageSize,
+          sort,
+          startBlock,
+          endBlock,
+          resultLength: 0,
+          windowExceeded: true,
+        })
+      : resolveTransfersPageData({
+          chain,
+          page: requestedPage,
+          pageSize: requestedPageSize,
+          sort,
+          startBlock,
+          endBlock,
+          forceRefresh,
+        });
+
+    const totalsPromise = includeTotals
+      ? resolveTransfersTotalData({
+          chain,
+          sort,
+          startBlock,
+          endBlock,
+          forceRefresh,
+        })
+      : Promise.resolve(null);
+
+    const [pageOutcome, totalsOutcome] = await Promise.allSettled([pagePromise, totalsPromise]);
+
+    if (pageOutcome.status !== 'fulfilled') {
+      throw pageOutcome.reason;
+    }
+
+    const pageData = pageOutcome.value;
+    const warmSummary = getCachedTransfersWarmSummary();
+    const warnings = [];
+
+    let totalsData = null;
+    if (totalsOutcome.status === 'fulfilled') {
+      totalsData = totalsOutcome.value;
+      if (totalsData?.windowCapped) {
+        warnings.push({
+          scope: 'total',
+          code: 'TOTAL_COUNT_CAPPED',
+          message: `This chain has more than ${totalsData.maxSafeOffset || ETHERSCAN_RESULT_WINDOW} transfers. Total count may be underestimated due to result window limits.`,
+          retryable: false,
+        });
+      }
+    } else if (includeTotals) {
+      const reason = totalsOutcome.reason || {};
+      console.warn(`! Failed to refresh transfer totals for ${chain.name}: ${reason.message || reason}`);
+      warnings.push({
+        scope: 'total',
+        code: reason.code || 'TOTAL_FETCH_FAILED',
+        message: reason.message || 'Failed to compute total transfer count; returning latest page data only.',
+        retryable: true,
       });
     }
 
-    const chainIds = requestedChainId === 0
-      ? CHAINS.map((chain) => chain.id)
-      : [requestedChainId];
+    if (pageData.stale && pageData.error) {
+      warnings.push({
+        scope: 'page',
+        code: pageData.error.code || 'STALE_PAGE',
+        message: pageData.error.message || 'Page data returned from stale cache after upstream failure.',
+      });
+    }
 
-    const pageData = await persistentStore.queryTransfersPage({
-      chainId: chainIds,
-      page: requestedPage,
-      pageSize: requestedPageSize,
-      sort,
-      startBlock,
-      endBlock,
-    });
+    if (totalsData?.stale && totalsData.error) {
+      warnings.push({
+        scope: 'total',
+        code: totalsData.error.code || 'STALE_TOTAL',
+        message: totalsData.error.message || 'Total count returned from stale cache after upstream failure.',
+      });
+    }
 
-    const totalCount = includeTotals
-      ? await persistentStore.countTransfers({ chainId: chainIds, startBlock, endBlock })
-      : pageData.resultLength;
+    const windowExceeded = Boolean(pageData.windowExceeded || requestExceedsWindow);
+    if (windowExceeded && resultWindowLimit) {
+      warnings.push({
+        scope: 'page',
+        code: 'RESULT_WINDOW_CAP',
+        message: `Upstream API only returns the latest ${resultWindowLimit.toLocaleString()} transfers per query. Reduce the page size or apply block filters to view older activity.`,
+      });
+    }
 
-    const totalPages = totalCount > 0
+    const totalCount = totalsData ? totalsData.total : pageData.resultLength || 0;
+    const totalPagesRaw = totalCount > 0
       ? Math.ceil(totalCount / requestedPageSize)
       : (pageData.resultLength === requestedPageSize ? requestedPage + 1 : requestedPage);
-
-    const hasMore = totalCount > requestedPage * requestedPageSize;
-    const { lastTime, lagSeconds } = await persistentStore.getMaxTimestamp({ chainId: chainIds });
-    const warmSummary = await getPersistentWarmSummary();
-
-    const warnings = [];
-    if (typeof lagSeconds === 'number' && lagSeconds > 600) {
-      warnings.push({
-        scope: 'store',
-        code: 'INGEST_LAG',
-        message: `Transfer ingestion is ${lagSeconds} seconds behind.`,
-        retryable: false,
-      });
+    const totalPages = maxWindowPagesForRequest
+      ? Math.min(totalPagesRaw || maxWindowPagesForRequest, maxWindowPagesForRequest)
+      : totalPagesRaw;
+    let hasMore = pageData.resultLength === requestedPageSize;
+    if (totalCount > 0) {
+      hasMore = totalCount > requestedPage * requestedPageSize;
     }
-
-    const chainMeta = requestedChainId === 0
-      ? { id: 0, name: 'All Chains' }
-      : (() => {
-          const chain = getChainDefinition(requestedChainId);
-          return chain ? { id: chain.id, name: chain.name } : { id: requestedChainId, name: `Chain ${requestedChainId}` };
-        })();
-
-    const responseChains = warmSummary.chains.map((entry) => ({
-      chainId: entry.chainId,
-      chainName: entry.chainName,
-      lagSeconds: entry.lagSeconds,
-      lastBlockNumber: entry.lastBlockNumber,
-      lastTime: entry.lastTime,
-      updatedAt: entry.updatedAt,
-    }));
+    if (maxWindowPagesForRequest && requestedPage >= maxWindowPagesForRequest) {
+      hasMore = false;
+    }
+    if (windowExceeded) {
+      hasMore = false;
+    }
+    const timestamp = pageData.timestamp || pageData.cacheTimestamp || Date.now();
 
     res.json({
       data: Array.isArray(pageData.transfers) ? pageData.transfers : [],
@@ -1774,34 +2114,37 @@ const handlePersistentTransfers = async (req, res, options) => {
         total: totalCount,
         totalPages,
         hasMore,
-        windowExceeded: false,
-        maxWindowPages: null,
-        resultWindow: null,
+        windowExceeded,
+        maxWindowPages: maxWindowPagesForRequest,
+        resultWindow: resultWindowLimit,
       },
-      totals: includeTotals
+      totals: totalsData
         ? {
-            total: totalCount,
-            truncated: false,
-            resultLength: totalCount,
-            timestamp: Date.now(),
-            stale: false,
-            source: 'store',
+            total: totalsData.total,
+            truncated: totalsData.truncated,
+            resultLength: totalsData.resultLength,
+            timestamp: totalsData.timestamp,
+            stale: totalsData.stale,
+            source: totalsData.source,
           }
         : null,
-      chain: chainMeta,
+      chain: {
+        id: chain.id,
+        name: chain.name,
+      },
       sort,
       filters: {
         startBlock: typeof startBlock === 'number' ? startBlock : null,
         endBlock: typeof endBlock === 'number' ? endBlock : null,
       },
-      timestamp: Date.now(),
-      stale: false,
-      source: 'store',
+      timestamp,
+      stale: Boolean(pageData.stale || totalsData?.stale),
+      source: pageData.source || 'upstream',
       warnings,
       limits: {
         maxPageSize: TRANSFERS_MAX_PAGE_SIZE,
         totalFetchLimit: TRANSFERS_TOTAL_FETCH_LIMIT,
-        resultWindow: null,
+        resultWindow: resultWindowLimit,
       },
       defaults: {
         chainId: TRANSFERS_DEFAULT_CHAIN_ID,
@@ -1809,36 +2152,90 @@ const handlePersistentTransfers = async (req, res, options) => {
         sort: 'desc',
       },
       warm: {
-        chains: responseChains,
+        chains: warmSummary.chains,
         timestamp: warmSummary.timestamp,
-        source: 'store',
       },
-      chains: responseChains,
-      availableChains: [{ id: 0, name: 'All Chains' }, ...CHAINS.map((c) => ({ id: c.id, name: c.name }))],
-      freshness: {
-        lastIngestedAt: lastTime ? lastTime.toISOString() : null,
-        ingestLagSeconds: lagSeconds,
-      },
+      chains: warmSummary.chains,
+      availableChains: CHAINS.map((c) => ({ id: c.id, name: c.name })),
       request: {
+        forceRefresh,
         includeTotals,
-        dataSource: 'store',
+        dataSource: 'upstream',
       },
     });
   } catch (error) {
-    console.error('X Persistent transfers handler failed:', error.message || error);
+    console.error('Error handling upstream /api/transfers request:', error.message || error);
+
+    const providerKey = getProviderKeyForChain(chain);
+    const providerLabel = providerKey === 'cronos' ? 'Cronos explorer' : 'Etherscan';
+
+    if (error.code === 'ETHERSCAN_PRO_ONLY') {
+      return res.status(402).json({
+        message: 'Etherscan PRO plan required for this request',
+        details: error.payload || null,
+      });
+    }
+
+    if (error.code && error.payload) {
+      return respondUpstreamFailure(res, `Failed to fetch transfers from ${providerLabel}`, {
+        upstreamProvider: providerKey,
+        errorCode: error.code,
+        upstreamResponse: error.payload,
+      });
+    }
+
     return res.status(500).json({
-      message: 'Failed to read transfers from persistent store',
+      message: `Failed to fetch transfers from ${providerLabel}`,
       error: error.message || String(error),
     });
   }
 };
 
-const fetchPageForIngestion = async ({ chain, page, pageSize, sort }) => {
-  return fetchTransfersPageFromChain({
-    chain,
-    page,
-    pageSize,
+const handleTransferRequest = async (req, res, options) => {
+  const {
+    requestedChainId,
+    requestedPage,
+    requestedPageSize,
     sort,
+    startBlock,
+    endBlock,
+    includeTotals,
+    forceRefresh,
+  } = options;
+
+  if (TRANSFERS_DATA_SOURCE === 'store' || TRANSFERS_DATA_SOURCE === 'persistent') {
+    return handlePersistentTransfers(req, res, {
+      requestedChainId,
+      requestedPage,
+      requestedPageSize,
+      sort,
+      startBlock,
+      endBlock,
+      includeTotals,
+    });
+  }
+
+  if (requestedChainId === 0) {
+    return handleAggregatedTransfers(req, res, {
+      forceRefresh,
+      requestedPage,
+      requestedPageSize,
+      sort,
+      startBlock,
+      endBlock,
+      includeTotals,
+    });
+  }
+
+  return handleUpstreamTransfers(req, res, {
+    forceRefresh,
+    requestedChainId,
+    requestedPage,
+    requestedPageSize,
+    sort,
+    startBlock,
+    endBlock,
+    includeTotals,
   });
 };
 
@@ -1854,28 +2251,10 @@ const bootstrapPersistentStore = async () => {
     }
 
     if (!status.ready) {
-      console.warn('! Persistent store initialization incomplete. Transfers will continue using upstream APIs until ready.');
-      if (USE_PERSISTENT_TRANSFERS) {
-        setTimeout(() => {
-          if (!persistentStoreReady) {
-            console.error('X Persistent store still not ready after initialization timeout.');
-          }
-        }, PERSISTENT_STORE_BOOTSTRAP_TIMEOUT_MS);
-      }
+      console.warn('! Persistent store initialization incomplete. Waiting for ingester to populate snapshots.');
       return;
     }
-
-    if (transferIngestionController) {
-      transferIngestionController.stop();
-      transferIngestionController = null;
-    }
-
-    transferIngestionController = startTransferIngestion({
-      chains: CHAINS,
-      fetchPage: fetchPageForIngestion,
-    });
-
-    console.log('✓ Persistent transfer ingestion pipeline started.');
+    console.log('✓ Persistent store ready for API traffic.');
   } catch (error) {
     persistentStoreReady = false;
     persistentStoreInitError = error;
@@ -2886,10 +3265,6 @@ app.get('/api/info', strictLimiter, cacheMiddleware(300), async (req, res) => {
 const shutdown = async () => {
   console.log('-> Shutting down backend...');
   try {
-    if (transferIngestionController && typeof transferIngestionController.stop === 'function') {
-      transferIngestionController.stop();
-      transferIngestionController = null;
-    }
     await persistentStore.closePersistentStore();
   } catch (error) {
     console.error('X Error during shutdown:', error.message || error);
@@ -2928,11 +3303,8 @@ app.get('/api/transfers', async (req, res) => {
     });
   }
 
-  // Special handling for "All Chains" aggregation (chainId = 0)
-  const isAggregatedView = requestedChainId === 0;
-
-  if (USE_PERSISTENT_TRANSFERS) {
-    return handlePersistentTransfers(req, res, {
+  try {
+    await handleTransferRequest(req, res, {
       requestedChainId,
       requestedPage,
       requestedPageSize,
@@ -2940,234 +3312,12 @@ app.get('/api/transfers', async (req, res) => {
       startBlock,
       endBlock,
       includeTotals,
-    });
-  }
-
-  if (isAggregatedView) {
-    return handleAggregatedTransfers(req, res, {
       forceRefresh,
-      requestedPage,
-      requestedPageSize,
-      sort,
-      startBlock,
-      endBlock,
-      includeTotals,
-    });
-  }
-
-  const chain = getChainDefinition(requestedChainId) || getChainDefinition(TRANSFERS_DEFAULT_CHAIN_ID) || CHAINS[0];
-  if (!chain) {
-    return res.status(400).json({
-      message: 'Unsupported chain requested',
-      chainId: requestedChainId,
-      availableChains: CHAINS,
-    });
-  }
-
-  try {
-    getProviderConfigForChain(chain);
-  } catch (providerError) {
-    return res.status(500).json({ message: providerError.message });
-  }
-
-  const chainIsCronos = getProviderKeyForChain(chain) === 'cronos';
-  const resultWindowLimit = !chainIsCronos && Number.isFinite(ETHERSCAN_RESULT_WINDOW)
-    ? Math.max(0, ETHERSCAN_RESULT_WINDOW)
-    : null;
-  const maxWindowPagesForRequest = resultWindowLimit
-    ? Math.max(1, Math.floor(resultWindowLimit / requestedPageSize) || 1)
-    : null;
-  const requestExceedsWindow = Boolean(resultWindowLimit && requestedPage > maxWindowPagesForRequest);
-
-  try {
-    const pagePromise = requestExceedsWindow
-      ? Promise.resolve({
-          transfers: [],
-          upstream: null,
-          timestamp: Date.now(),
-          page: requestedPage,
-          pageSize: requestedPageSize,
-          sort,
-          startBlock,
-          endBlock,
-          resultLength: 0,
-          windowExceeded: true,
-        })
-      : resolveTransfersPageData({
-          chain,
-          page: requestedPage,
-          pageSize: requestedPageSize,
-          sort,
-          startBlock,
-          endBlock,
-          forceRefresh,
-        });
-
-    const totalsPromise = includeTotals
-      ? resolveTransfersTotalData({
-          chain,
-          sort,
-          startBlock,
-          endBlock,
-          forceRefresh,
-        })
-      : Promise.resolve(null);
-
-    const [pageOutcome, totalsOutcome] = await Promise.allSettled([pagePromise, totalsPromise]);
-
-    if (pageOutcome.status !== 'fulfilled') {
-      throw pageOutcome.reason;
-    }
-
-    const pageData = pageOutcome.value;
-    const warmSummary = getCachedTransfersWarmSummary();
-    const warnings = [];
-
-    let totalsData = null;
-    if (totalsOutcome.status === 'fulfilled') {
-      totalsData = totalsOutcome.value;
-      
-      // Add warning if totals are window-capped
-      if (totalsData?.windowCapped) {
-        warnings.push({
-          scope: 'total',
-          code: 'TOTAL_COUNT_CAPPED',
-          message: `This chain has more than ${totalsData.maxSafeOffset || ETHERSCAN_RESULT_WINDOW} transfers. Total count may be underestimated due to Etherscan result window limits.`,
-          retryable: false,
-        });
-      }
-    } else if (includeTotals) {
-      const reason = totalsOutcome.reason || {};
-      console.warn(`! Failed to refresh transfer totals for ${chain.name}: ${reason.message || reason}`);
-      warnings.push({
-        scope: 'total',
-        code: reason.code || 'TOTAL_FETCH_FAILED',
-        message: reason.message || 'Failed to compute total transfer count; returning latest page data only.',
-        retryable: true,
-      });
-    }
-
-    if (pageData.stale && pageData.error) {
-      warnings.push({
-        scope: 'page',
-        code: pageData.error.code || 'STALE_PAGE',
-        message: pageData.error.message || 'Page data returned from stale cache after upstream failure.',
-      });
-    }
-
-    if (totalsData?.stale && totalsData.error) {
-      warnings.push({
-        scope: 'total',
-        code: totalsData.error.code || 'STALE_TOTAL',
-        message: totalsData.error.message || 'Total count returned from stale cache after upstream failure.',
-      });
-    }
-
-    const windowExceeded = Boolean(pageData.windowExceeded || requestExceedsWindow);
-    if (windowExceeded && resultWindowLimit) {
-      warnings.push({
-        scope: 'page',
-        code: 'RESULT_WINDOW_CAP',
-        message: `Etherscan only returns the latest ${resultWindowLimit.toLocaleString()} transfers per query. Reduce the page size or apply block filters to view older activity.`,
-      });
-    }
-
-    const totalCount = totalsData ? totalsData.total : pageData.resultLength || 0;
-    const totalPagesRaw = totalCount > 0 ? Math.ceil(totalCount / requestedPageSize) : (pageData.resultLength === requestedPageSize ? requestedPage + 1 : requestedPage);
-    const totalPages = maxWindowPagesForRequest
-      ? Math.min(totalPagesRaw || maxWindowPagesForRequest, maxWindowPagesForRequest)
-      : totalPagesRaw;
-    let hasMore = pageData.resultLength === requestedPageSize;
-    if (totalCount > 0) {
-      hasMore = totalCount > requestedPage * requestedPageSize;
-    }
-    if (maxWindowPagesForRequest && requestedPage >= maxWindowPagesForRequest) {
-      hasMore = false;
-    }
-    if (windowExceeded) {
-      hasMore = false;
-    }
-    const timestamp = pageData.timestamp || pageData.cacheTimestamp || Date.now();
-
-    res.json({
-      data: Array.isArray(pageData.transfers) ? pageData.transfers : [],
-      pagination: {
-        page: requestedPage,
-        pageSize: requestedPageSize,
-        total: totalCount,
-        totalPages,
-        hasMore,
-        windowExceeded,
-        maxWindowPages: maxWindowPagesForRequest,
-        resultWindow: resultWindowLimit,
-      },
-      totals: totalsData
-        ? {
-            total: totalsData.total,
-            truncated: totalsData.truncated,
-            resultLength: totalsData.resultLength,
-            timestamp: totalsData.timestamp,
-            stale: totalsData.stale,
-            source: totalsData.source,
-          }
-        : null,
-      chain: {
-        id: chain.id,
-        name: chain.name,
-      },
-      sort,
-      filters: {
-        startBlock: typeof startBlock === 'number' ? startBlock : null,
-        endBlock: typeof endBlock === 'number' ? endBlock : null,
-      },
-      timestamp,
-      stale: Boolean(pageData.stale || totalsData?.stale),
-      source: pageData.source,
-      warnings,
-      limits: {
-        maxPageSize: TRANSFERS_MAX_PAGE_SIZE,
-        totalFetchLimit: TRANSFERS_TOTAL_FETCH_LIMIT,
-        resultWindow: resultWindowLimit,
-      },
-      defaults: {
-        chainId: TRANSFERS_DEFAULT_CHAIN_ID,
-        pageSize: TRANSFERS_DEFAULT_PAGE_SIZE,
-        sort: 'desc',
-      },
-      warm: {
-        chains: warmSummary.chains,
-        timestamp: warmSummary.timestamp,
-      },
-      chains: warmSummary.chains,
-      availableChains: CHAINS.map((c) => ({ id: c.id, name: c.name })),
-      request: {
-        forceRefresh,
-        includeTotals,
-      },
     });
   } catch (error) {
     console.error('Error handling /api/transfers request:', error.message || error);
-
-    const providerKey = getProviderKeyForChain(chain);
-    const providerLabel = providerKey === 'cronos' ? 'Cronos explorer' : 'Etherscan';
-
-    if (error.code === 'ETHERSCAN_PRO_ONLY') {
-      return res.status(402).json({
-        message: 'Etherscan PRO plan required for this request',
-        details: error.payload || null,
-      });
-    }
-
-    if (error.code && error.payload) {
-      return respondUpstreamFailure(res, `Failed to fetch transfers from ${providerLabel}`, {
-        upstreamProvider: providerKey,
-        errorCode: error.code,
-        upstreamResponse: error.payload,
-      });
-    }
-
-    return res.status(500).json({
-      message: `Failed to fetch transfers from ${providerLabel}`,
+    res.status(500).json({
+      message: 'Failed to fetch transfers',
       error: error.message || String(error),
     });
   }
@@ -3430,10 +3580,155 @@ app.get('/api/cache-health', async (req, res) => {
       warm: persistentWarmSummary,
     },
     ingestion: {
-      running: Boolean(transferIngestionController),
-      enabled: Boolean(transferIngestionController) && persistentStatus.ready,
+      managedBy: 'bzr-ingester',
+      enabled: persistentStatus.ready,
+      note: 'Ingestion is supervised by the external bzr-ingester service.',
     },
     serverTime: new Date(now).toISOString(),
+  });
+});
+
+app.get('/api/health', async (req, res) => {
+  const now = Date.now();
+  const uptimeSeconds = Math.floor(process.uptime());
+  const storeEnabled = persistentStore.isPersistentStoreEnabled();
+  const storeReadyFlag = persistentStore.isPersistentStoreReady();
+
+  let rawSnapshots = [];
+  const warningItems = [];
+
+  if (storeEnabled && storeReadyFlag) {
+    try {
+      rawSnapshots = await persistentStore.getChainSnapshots(CHAINS.map((chain) => chain.id));
+    } catch (error) {
+      warningItems.push({
+        scope: 'store',
+        code: 'STORE_SNAPSHOT_FAILED',
+        message: error.message || 'Failed to load chain snapshots metadata.',
+        retryable: true,
+      });
+    }
+  }
+
+  const snapshots = normalizeChainSnapshots(rawSnapshots);
+  const totalTransfers = snapshots.reduce((sum, snapshot) => sum + (snapshot.totalTransfers || 0), 0);
+  const indexLagSec = snapshots.reduce((max, snapshot) => {
+    if (typeof snapshot.indexLagSeconds === 'number') {
+      return max === null ? snapshot.indexLagSeconds : Math.max(max, snapshot.indexLagSeconds);
+    }
+    return max;
+  }, null);
+  const ready = Boolean(storeEnabled && storeReadyFlag) && (snapshots.length > 0 ? snapshots.every((snapshot) => snapshot.ready) : true);
+  const stale = typeof indexLagSec === 'number' ? indexLagSec > INGEST_STALE_THRESHOLD_SECONDS : !ready;
+
+  if (!storeEnabled) {
+    warningItems.push({
+      scope: 'store',
+      code: 'STORE_DISABLED',
+      message: 'Persistent store is disabled; API will rely on upstream providers.',
+      retryable: false,
+    });
+  } else if (!storeReadyFlag) {
+    warningItems.push({
+      scope: 'store',
+      code: 'STORE_INITIALIZING',
+      message: 'Persistent store initialization in progress; ingestion may be unavailable.',
+      retryable: true,
+    });
+  }
+
+  if (persistentStoreInitError) {
+    warningItems.push({
+      scope: 'store',
+      code: 'STORE_INIT_ERROR',
+      message: persistentStoreInitError.message,
+      retryable: true,
+    });
+  }
+
+  if (stale) {
+    warningItems.push({
+      scope: 'ingester',
+      code: 'STORE_DATA_STALE',
+      message: 'Latest ingested data is stale; serving last successful snapshot.',
+      retryable: true,
+    });
+  }
+
+  const lastSuccessAt = snapshots.reduce((latest, snapshot) => {
+    if (!snapshot.lastSuccessAt) {
+      return latest;
+    }
+    const value = Date.parse(snapshot.lastSuccessAt);
+    if (!Number.isFinite(value)) {
+      return latest;
+    }
+    if (!latest || value > latest) {
+      return value;
+    }
+    return latest;
+  }, null);
+
+  const lastErrorAt = snapshots.reduce((latest, snapshot) => {
+    if (!snapshot.lastErrorAt) {
+      return latest;
+    }
+    const value = Date.parse(snapshot.lastErrorAt);
+    if (!Number.isFinite(value)) {
+      return latest;
+    }
+    if (!latest || value > latest) {
+      return value;
+    }
+    return latest;
+  }, null);
+
+  const status = !storeEnabled
+    ? 'upstream-only'
+    : !storeReadyFlag
+      ? 'initializing'
+      : stale
+        ? 'degraded'
+        : 'ok';
+
+  const chainStatuses = snapshots.map((snapshot) => ({
+    ...snapshot,
+    lagHuman: typeof snapshot.indexLagSeconds === 'number' ? `${snapshot.indexLagSeconds}s` : null,
+  }));
+
+  res.json({
+    status,
+    timestamp: new Date(now).toISOString(),
+    uptimeSeconds,
+    uptime: {
+      seconds: uptimeSeconds,
+      startedAt: new Date(SERVER_START_TIME).toISOString(),
+    },
+    meta: {
+      ready,
+      stale,
+      indexLagSec: indexLagSec === null ? null : indexLagSec,
+      totalTransfers,
+    },
+    store: {
+      enabled: storeEnabled,
+      ready: storeReadyFlag,
+      error: persistentStoreInitError ? persistentStoreInitError.message : null,
+    },
+    chains: chainStatuses,
+    services: {
+      backend: {
+        pid: process.pid,
+        status: 'ok',
+      },
+      ingester: {
+        managedBy: 'systemd',
+        status: stale ? 'degraded' : (ready ? 'ok' : 'initializing'),
+        lastSuccessAt: lastSuccessAt ? new Date(lastSuccessAt).toISOString() : null,
+        lastErrorAt: lastErrorAt ? new Date(lastErrorAt).toISOString() : null,
+      },
+    },
+    warnings: warningItems,
   });
 });
 
