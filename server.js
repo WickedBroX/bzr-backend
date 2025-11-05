@@ -9,6 +9,14 @@ const rateLimit = require('express-rate-limit');
 const NodeCache = require('node-cache');
 const compression = require('compression');
 const persistentStore = require('./src/persistentStore');
+const {
+  computePersistentAnalytics,
+  convertRawToToken,
+  roundNumber,
+  buildPredictionSeries,
+  computeAnomalies,
+  TIME_RANGE_TO_DAYS,
+} = require('./src/analyticsService');
 const { startTransferIngestion } = require('./src/transfersIngestion');
 
 const app = express();
@@ -306,6 +314,11 @@ const TOKEN_PRICE_FALLBACK_CHAIN_ID_SET = new Set(TOKEN_PRICE_FALLBACK_CHAIN_IDS
 if (typeof BZR_ADDRESS === 'string' && BZR_ADDRESS) {
   TOKEN_PRICE_FALLBACK_BASE_ADDRESS_SET.add(BZR_ADDRESS.toLowerCase());
 }
+
+const ANALYTICS_FALLBACK_MAX_TRANSFERS = Number(process.env.ANALYTICS_FALLBACK_MAX_TRANSFERS || 400);
+const ANALYTICS_FALLBACK_PAGE_SIZE = Number(process.env.ANALYTICS_FALLBACK_PAGE_SIZE || 100);
+const ANALYTICS_FALLBACK_MAX_PAGES = Number(process.env.ANALYTICS_FALLBACK_MAX_PAGES || 3);
+const VALID_ANALYTICS_TIME_RANGES = new Set(['7d', '30d', '90d', 'all']);
 const TRANSFERS_DEFAULT_CHAIN_ID = Number(process.env.TRANSFERS_DEFAULT_CHAIN_ID || 1);
 const TRANSFERS_DEFAULT_PAGE_SIZE = Number(process.env.TRANSFERS_DEFAULT_PAGE_SIZE || 25);
 const TRANSFERS_MAX_PAGE_SIZE = Number(process.env.TRANSFERS_MAX_PAGE_SIZE || 100);
@@ -344,6 +357,427 @@ const parseOptionalBlockNumber = (value) => {
   if (typeof value === 'undefined') return undefined;
   const numeric = Number(value);
   return Number.isFinite(numeric) && numeric >= 0 ? Math.floor(numeric) : undefined;
+};
+
+const getAnalyticsRangeStart = (timeRange) => {
+  const normalized = typeof timeRange === 'string' ? timeRange.toLowerCase() : '';
+  const days = TIME_RANGE_TO_DAYS[normalized];
+  if (!days || !Number.isFinite(days)) {
+    return null;
+  }
+
+  const end = new Date();
+  end.setUTCHours(23, 59, 59, 999);
+
+  const start = new Date(end);
+  start.setUTCDate(start.getUTCDate() - (days - 1));
+  start.setUTCHours(0, 0, 0, 0);
+  return start;
+};
+
+const buildTimelineBetween = (startDate, endDate) => {
+  const timeline = [];
+  if (!(startDate instanceof Date) || !(endDate instanceof Date)) {
+    return timeline;
+  }
+
+  const cursor = new Date(startDate);
+  cursor.setUTCHours(0, 0, 0, 0);
+  const boundary = new Date(endDate);
+  boundary.setUTCHours(0, 0, 0, 0);
+
+  if (cursor > boundary) {
+    return timeline;
+  }
+
+  while (cursor <= boundary) {
+    timeline.push(new Date(cursor));
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+
+  return timeline;
+};
+
+const parseTransferTimestampMs = (transfer) => {
+  if (!transfer) {
+    return null;
+  }
+
+  const candidates = [
+    transfer.timeStamp,
+    transfer.timestamp,
+    transfer.time_stamp,
+    transfer.blockTimestamp,
+  ];
+
+  for (const candidate of candidates) {
+    if (candidate === null || typeof candidate === 'undefined') {
+      continue;
+    }
+
+    const numeric = Number(candidate);
+    if (Number.isFinite(numeric) && numeric > 0) {
+      if (numeric > 1e12) {
+        return numeric;
+      }
+      if (numeric > 1e9) {
+        return numeric * 1000;
+      }
+      if (numeric > 1e6) {
+        return numeric * 1000;
+      }
+    }
+
+    if (typeof candidate === 'string') {
+      const parsedDate = Date.parse(candidate);
+      if (!Number.isNaN(parsedDate)) {
+        return parsedDate;
+      }
+    }
+  }
+
+  return null;
+};
+
+const computeMedian = (values = []) => {
+  if (!Array.isArray(values) || values.length === 0) {
+    return 0;
+  }
+
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 0) {
+    return (sorted[middle - 1] + sorted[middle]) / 2;
+  }
+  return sorted[middle];
+};
+
+const buildRealtimeAnalyticsSnapshot = ({ transfers, timeRange, chainIds, requestedChainId }) => {
+  const formatter = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' });
+  const rangeStart = getAnalyticsRangeStart(timeRange);
+  const rangeEnd = new Date();
+  rangeEnd.setUTCHours(23, 59, 59, 999);
+
+  const filtered = [];
+  const chainStats = new Map();
+  const addressStats = new Map();
+  const whaleCandidates = [];
+
+  transfers.forEach((transfer) => {
+    const timestampMs = parseTransferTimestampMs(transfer);
+    if (!timestampMs) {
+      return;
+    }
+
+    if (rangeStart && timestampMs < rangeStart.getTime()) {
+      return;
+    }
+
+    if (timestampMs > rangeEnd.getTime()) {
+      return;
+    }
+
+    const chainIdValue = Number(
+      transfer.chainId ??
+      transfer.chain_id ??
+      (transfer.chain && transfer.chain.id) ??
+      transfer.chainID
+    );
+    const chainId = Number.isFinite(chainIdValue) ? chainIdValue : null;
+
+    const volume = convertRawToToken(transfer.value, BZR_TOKEN_DECIMALS);
+    const fromAddress = (transfer.from || transfer.fromAddress || transfer.from_address || '').toLowerCase();
+    const toAddress = (transfer.to || transfer.toAddress || transfer.to_address || '').toLowerCase();
+
+    filtered.push({
+      transfer,
+      timestampMs,
+      chainId,
+      volume,
+      fromAddress,
+      toAddress,
+    });
+
+    if (chainId) {
+      let chainEntry = chainStats.get(chainId);
+      if (!chainEntry) {
+        chainEntry = { count: 0, volume: 0, addresses: new Set() };
+        chainStats.set(chainId, chainEntry);
+      }
+      chainEntry.count += 1;
+      chainEntry.volume += volume;
+      if (fromAddress) chainEntry.addresses.add(fromAddress);
+      if (toAddress) chainEntry.addresses.add(toAddress);
+    }
+
+    const ensureAddressEntry = (address) => {
+      if (!address) {
+        return null;
+      }
+      const key = address.toLowerCase();
+      let entry = addressStats.get(key);
+      if (!entry) {
+        entry = { address: key, sent: 0, received: 0, volume: 0 };
+        addressStats.set(key, entry);
+      }
+      return entry;
+    };
+
+    const senderEntry = ensureAddressEntry(fromAddress);
+    if (senderEntry) {
+      senderEntry.sent += 1;
+      senderEntry.volume += volume;
+    }
+
+    const receiverEntry = ensureAddressEntry(toAddress);
+    if (receiverEntry) {
+      receiverEntry.received += 1;
+      receiverEntry.volume += volume;
+    }
+
+    whaleCandidates.push({
+      hash: transfer.hash || transfer.txHash || transfer.tx_hash,
+      from: fromAddress,
+      to: toAddress,
+      value: volume,
+      timestamp: Math.floor(timestampMs / 1000),
+      chainId,
+    });
+  });
+
+  const timestamps = filtered.map((entry) => entry.timestampMs);
+  const effectiveStart = rangeStart || (timestamps.length ? new Date(Math.min(...timestamps)) : new Date(rangeEnd));
+  const effectiveEnd = timestamps.length ? new Date(Math.max(...timestamps)) : new Date(rangeEnd);
+  effectiveStart.setUTCHours(0, 0, 0, 0);
+  effectiveEnd.setUTCHours(0, 0, 0, 0);
+
+  let timeline = buildTimelineBetween(effectiveStart, effectiveEnd);
+  if (!timeline.length) {
+    timeline = [new Date(effectiveStart)];
+  }
+
+  const dayBuckets = new Map();
+  filtered.forEach((entry) => {
+    const date = new Date(entry.timestampMs);
+    date.setUTCHours(0, 0, 0, 0);
+    const key = date.toISOString().split('T')[0];
+
+    if (!dayBuckets.has(key)) {
+      dayBuckets.set(key, {
+        count: 0,
+        volume: 0,
+        addresses: new Set(),
+        values: [],
+      });
+    }
+
+    const bucket = dayBuckets.get(key);
+    bucket.count += 1;
+    bucket.volume += entry.volume;
+    bucket.values.push(entry.volume);
+    if (entry.fromAddress) bucket.addresses.add(entry.fromAddress);
+    if (entry.toAddress) bucket.addresses.add(entry.toAddress);
+  });
+
+  const dailyData = [];
+  const dailyCounts = [];
+  const dailyVolumes = [];
+
+  timeline.forEach((date) => {
+    const key = date.toISOString().split('T')[0];
+    const bucket = dayBuckets.get(key) || { count: 0, volume: 0, addresses: new Set(), values: [] };
+    const median = computeMedian(bucket.values);
+    const volumeRounded = roundNumber(bucket.volume, 4);
+
+    dailyData.push({
+      date: key,
+      displayDate: formatter.format(date),
+      count: bucket.count,
+      volume: volumeRounded,
+      uniqueAddresses: bucket.addresses.size,
+      avgTransferSize: bucket.count ? roundNumber(bucket.volume / bucket.count, 4) : 0,
+      medianTransferSize: roundNumber(median, 4),
+    });
+
+    dailyCounts.push(bucket.count);
+    dailyVolumes.push(bucket.volume);
+  });
+
+  const totalTransfers = filtered.length;
+  const totalVolume = filtered.reduce((acc, entry) => acc + entry.volume, 0);
+  const activeAddresses = addressStats.size;
+  const daysCount = dailyData.length || 1;
+
+  const peakActivity = dailyData.reduce((current, entry) => {
+    if (!current) {
+      return { transfers: entry.count, volume: entry.volume, date: entry.date };
+    }
+
+    if (entry.count > current.transfers || (entry.count === current.transfers && entry.volume > current.volume)) {
+      return { transfers: entry.count, volume: entry.volume, date: entry.date };
+    }
+
+    return current;
+  }, null);
+
+  const chainDistribution = Array.from(chainStats.entries()).map(([chainId, stats]) => {
+    const volumeRounded = roundNumber(stats.volume, 4);
+    const percentage = totalVolume > 0 ? `${roundNumber((stats.volume / totalVolume) * 100, 2)}%` : '0%';
+    const chain = getChainDefinition(chainId);
+
+    return {
+      chain: chain?.name || `Chain ${chainId}`,
+      count: stats.count,
+      volume: volumeRounded,
+      uniqueAddresses: stats.addresses.size,
+      percentage,
+    };
+  });
+
+  const topAddresses = Array.from(addressStats.values())
+    .map((entry) => ({
+      address: entry.address,
+      totalTxs: entry.sent + entry.received,
+      sent: entry.sent,
+      received: entry.received,
+      volume: roundNumber(entry.volume, 4),
+    }))
+    .sort((a, b) => (b.totalTxs - a.totalTxs) || (b.volume - a.volume))
+    .slice(0, 15);
+
+  const topWhales = whaleCandidates
+    .sort((a, b) => b.value - a.value)
+    .slice(0, 15)
+    .map((entry) => ({
+      hash: entry.hash,
+      from: entry.from,
+      to: entry.to,
+      value: roundNumber(entry.value, 4),
+      timeStamp: entry.timestamp,
+      chain: getChainDefinition(entry.chainId)?.name || (entry.chainId ? `Chain ${entry.chainId}` : 'Unknown'),
+    }));
+
+  const medianDailyTransfers = computeMedian(dailyCounts);
+  const volatility = (() => {
+    if (dailyCounts.length < 2) {
+      return 0;
+    }
+    const mean = dailyCounts.reduce((acc, value) => acc + value, 0) / dailyCounts.length;
+    const variance = dailyCounts.reduce((acc, value) => acc + (value - mean) ** 2, 0) / dailyCounts.length;
+    return roundNumber(Math.sqrt(variance), 2);
+  })();
+
+  const predictionHorizon = Math.min(7, Math.max(3, Math.ceil(dailyCounts.length / 4)));
+  const predictions = {
+    transfers: buildPredictionSeries(dailyCounts, predictionHorizon),
+    volume: buildPredictionSeries(dailyVolumes, predictionHorizon),
+  };
+
+  const anomalies = {
+    transferSpikes: computeAnomalies(dailyCounts),
+    volumeSpikes: computeAnomalies(dailyVolumes),
+  };
+
+  return {
+    success: true,
+    timeRange,
+    chainId: requestedChainId,
+    dailyData,
+    analyticsMetrics: {
+      totalTransfers,
+      totalVolume: roundNumber(totalVolume, 4),
+      avgTransferSize: totalTransfers ? roundNumber(totalVolume / totalTransfers, 4) : 0,
+      activeAddresses,
+      transfersChange: null,
+      volumeChange: null,
+      addressesChange: null,
+      dailyAvgTransfers: roundNumber(totalTransfers / daysCount, 2),
+      dailyAvgVolume: roundNumber(totalVolume / daysCount, 4),
+      peakActivity,
+      volatility,
+      medianDailyTransfers: roundNumber(medianDailyTransfers, 2),
+    },
+    predictions,
+    anomalies,
+    chainDistribution,
+    topAddresses,
+    topWhales,
+    performance: {
+      computeTimeMs: 0,
+      dataPoints: dailyData.length,
+      totalTransfersAnalyzed: totalTransfers,
+      cacheStatus: 'realtime-sample',
+      cacheAge: null,
+    },
+    timestamp: Date.now(),
+  };
+};
+
+const computeRealtimeAnalyticsFallback = async ({ timeRange, chainIds, requestedChainId }) => {
+  const uniqueChainIds = Array.isArray(chainIds) && chainIds.length
+    ? [...new Set(chainIds.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0))]
+    : CHAINS.map((chain) => chain.id);
+
+  const startTime = Date.now();
+  const transfers = [];
+  for (const chainId of uniqueChainIds) {
+    const chain = getChainDefinition(chainId);
+    if (!chain) {
+      continue;
+    }
+
+    let page = 1;
+    let fetched = 0;
+    const perChainLimit = Math.max(50, Math.floor(ANALYTICS_FALLBACK_MAX_TRANSFERS / uniqueChainIds.length));
+
+    while (page <= ANALYTICS_FALLBACK_MAX_PAGES && fetched < perChainLimit) {
+      const remaining = perChainLimit - fetched;
+      const pageSize = Math.min(ANALYTICS_FALLBACK_PAGE_SIZE, Math.max(10, remaining));
+
+      try {
+        const pageResult = await resolveTransfersPageData({
+          chain,
+          page,
+          pageSize,
+          sort: 'desc',
+          startBlock: undefined,
+          endBlock: undefined,
+          forceRefresh: false,
+        });
+
+        const pageTransfers = Array.isArray(pageResult?.transfers) ? pageResult.transfers : [];
+        if (!pageTransfers.length) {
+          break;
+        }
+
+        pageTransfers.forEach((transfer) => {
+          transfers.push({ ...transfer, chainId: chain.id });
+        });
+
+        fetched += pageTransfers.length;
+        if (pageTransfers.length < pageSize) {
+          break;
+        }
+
+        page += 1;
+      } catch (error) {
+        console.warn(`[Analytics] Realtime fallback fetch failed for chain ${chain.name}:`, error.message || error);
+        break;
+      }
+    }
+  }
+
+  const snapshot = buildRealtimeAnalyticsSnapshot({
+    transfers,
+    timeRange,
+    chainIds: uniqueChainIds,
+    requestedChainId,
+  });
+
+  snapshot.performance.computeTimeMs = Date.now() - startTime;
+  snapshot.performance.sampleSize = transfers.length;
+  snapshot.performance.cacheStatus = transfers.length ? 'realtime-sample' : 'empty';
+  return snapshot;
 };
 
 const getChainDefinition = (chainId) => CHAINS.find((chain) => chain.id === chainId);
@@ -3100,49 +3534,73 @@ app.post('/api/cache/invalidate', (req, res) => {
  * Returns comprehensive analytics data from cached transfers
  */
 app.get('/api/analytics', cacheMiddleware(60), async (req, res) => {
-  try {
-    const { timeRange = '30d', chainId = 'all' } = req.query;
-    
-    // Return minimal analytics structure
-    const analyticsData = {
-      success: true,
-      timeRange,
-      chainId,
-      dailyData: [],
-      analyticsMetrics: {
-        totalTransfers: 0,
-        totalVolume: 0,
-        avgTransferSize: 0,
-        activeAddresses: 0,
-        transfersChange: 0,
-        volumeChange: 0,
-        addressesChange: 0,
-        dailyAvgTransfers: 0,
-        dailyAvgVolume: 0,
-        volatility: 0,
-        medianDailyTransfers: 0
-      },
-      predictions: { transfers: [], volume: [] },
-      anomalies: { transferSpikes: [], volumeSpikes: [] },
-      chainDistribution: [],
-      topAddresses: [],
-      topWhales: [],
-      performance: {
-        computeTimeMs: 0,
-        dataPoints: 0,
-        totalTransfersAnalyzed: 0,
-        cacheStatus: 'minimal'
-      },
-      timestamp: Date.now()
-    };
+  const requestStarted = Date.now();
 
-    res.json(analyticsData);
+  try {
+    const rawTimeRange = typeof req.query.timeRange === 'string' ? req.query.timeRange.toLowerCase() : '30d';
+    const timeRange = VALID_ANALYTICS_TIME_RANGES.has(rawTimeRange) ? rawTimeRange : '30d';
+
+    const rawChainId = typeof req.query.chainId === 'string' ? req.query.chainId : (req.query.chainId ?? 'all');
+    const normalizedChainId = String(rawChainId).toLowerCase();
+
+    let chainIds;
+    if (normalizedChainId === 'all' || normalizedChainId === '0') {
+      chainIds = CHAINS.map((chain) => chain.id);
+    } else {
+      const numericChainId = Number(normalizedChainId);
+      if (!Number.isFinite(numericChainId) || numericChainId <= 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid chainId parameter',
+          chainId: rawChainId,
+        });
+      }
+      chainIds = [numericChainId];
+    }
+
+    try {
+      const result = await computePersistentAnalytics({
+        timeRange,
+        chainIds,
+        chains: CHAINS,
+        decimals: BZR_TOKEN_DECIMALS,
+      });
+
+      const analyticsData = result.analyticsData;
+      analyticsData.chainId = normalizedChainId;
+      analyticsData.performance.computeTimeMs = Math.max(
+        analyticsData.performance.computeTimeMs,
+        Date.now() - requestStarted,
+      );
+      analyticsData.performance.mode = 'persistent';
+
+      return res.json(analyticsData);
+    } catch (error) {
+      if (error.code !== 'PERSISTENT_STORE_UNAVAILABLE') {
+        throw error;
+      }
+
+      const fallback = await computeRealtimeAnalyticsFallback({
+        timeRange,
+        chainIds,
+        requestedChainId: normalizedChainId,
+      });
+
+      fallback.performance.computeTimeMs = Math.max(
+        fallback.performance.computeTimeMs,
+        Date.now() - requestStarted,
+      );
+      fallback.performance.mode = 'realtime';
+
+      return res.json(fallback);
+    }
   } catch (error) {
     console.error('[Analytics] Error:', error);
     res.status(500).json({
       success: false,
       error: 'Failed to compute analytics',
-      timestamp: Date.now()
+      details: error.message || String(error),
+      timestamp: Date.now(),
     });
   }
 });

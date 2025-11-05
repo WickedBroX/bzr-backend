@@ -351,7 +351,30 @@ const getLatestIngestSummary = async () => {
   }));
 };
 
-const buildFilterClause = ({ chainId, startBlock, endBlock }) => {
+const normalizeDateInput = (value) => {
+  if (!value) return null;
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return value;
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const numericDate = new Date(value);
+    if (!Number.isNaN(numericDate.getTime())) {
+      return numericDate;
+    }
+  }
+
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value);
+    if (!Number.isNaN(parsed)) {
+      return new Date(parsed);
+    }
+  }
+
+  return null;
+};
+
+const buildFilterClause = ({ chainId, startBlock, endBlock, startTime, endTime }) => {
   const conditions = [];
   const values = [];
 
@@ -376,6 +399,18 @@ const buildFilterClause = ({ chainId, startBlock, endBlock }) => {
   if (typeof endBlock === 'number') {
     values.push(Number(endBlock));
     conditions.push(`block_number <= $${values.length}::BIGINT`);
+  }
+
+  const normalizedStartTime = normalizeDateInput(startTime);
+  if (normalizedStartTime) {
+    values.push(normalizedStartTime);
+    conditions.push(`time_stamp >= $${values.length}::TIMESTAMPTZ`);
+  }
+
+  const normalizedEndTime = normalizeDateInput(endTime);
+  if (normalizedEndTime) {
+    values.push(normalizedEndTime);
+    conditions.push(`time_stamp <= $${values.length}::TIMESTAMPTZ`);
   }
 
   const clause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
@@ -479,6 +514,225 @@ const getMaxTimestamp = async ({ chainId }) => {
   };
 };
 
+const queryDailyAnalytics = async ({ chainId, startTime, endTime }) => {
+  if (!storeEnabled || !storeReady) {
+    throw new Error('Persistent store unavailable');
+  }
+
+  const chainFilter = Array.isArray(chainId) ? chainId : [chainId];
+  const { clause, values } = buildFilterClause({ chainId: chainFilter, startTime, endTime });
+
+  const result = await withClient((client) => client.query(
+    `
+      SELECT
+        DATE_TRUNC('day', time_stamp) AS day,
+        COUNT(*) AS transfer_count,
+  SUM(value::numeric) AS volume_raw,
+        ARRAY_REMOVE(ARRAY_AGG(DISTINCT from_address), NULL) AS from_addresses,
+        ARRAY_REMOVE(ARRAY_AGG(DISTINCT to_address), NULL) AS to_addresses,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY value::numeric) AS median_raw
+      FROM transfer_events
+      ${clause}
+      GROUP BY day
+      ORDER BY day ASC;
+    `,
+    values
+  ));
+
+  return result.rows.map((row) => ({
+    day: row.day ? new Date(row.day) : null,
+    transferCount: Number.parseInt(row.transfer_count, 10) || 0,
+    volumeRaw: row.volume_raw || '0',
+    medianRaw: row.median_raw || null,
+    fromAddresses: Array.isArray(row.from_addresses) ? row.from_addresses : [],
+    toAddresses: Array.isArray(row.to_addresses) ? row.to_addresses : [],
+  }));
+};
+
+const queryAnalyticsSummary = async ({ chainId, startTime, endTime }) => {
+  if (!storeEnabled || !storeReady) {
+    throw new Error('Persistent store unavailable');
+  }
+
+  const chainFilter = Array.isArray(chainId) ? chainId : [chainId];
+  const { clause, values } = buildFilterClause({ chainId: chainFilter, startTime, endTime });
+
+  const result = await withClient((client) => client.query(
+    `
+      WITH filtered AS (
+        SELECT *
+        FROM transfer_events
+        ${clause}
+      )
+      SELECT
+        COALESCE((SELECT COUNT(*) FROM filtered), 0) AS total_transfers,
+  COALESCE((SELECT SUM(value::numeric) FROM filtered), 0::NUMERIC) AS volume_raw,
+        (SELECT MIN(time_stamp) FROM filtered) AS first_time,
+        (SELECT MAX(time_stamp) FROM filtered) AS last_time,
+        COALESCE((
+          SELECT COUNT(DISTINCT address)
+          FROM (
+            SELECT from_address AS address FROM filtered
+            UNION
+            SELECT to_address AS address FROM filtered
+          ) participants
+        ), 0) AS unique_addresses
+      ;
+    `,
+    values
+  ));
+
+  const row = result.rows[0] || {};
+  return {
+    totalTransfers: Number.parseInt(row.total_transfers, 10) || 0,
+    volumeRaw: row.volume_raw || '0',
+    firstTime: row.first_time ? new Date(row.first_time) : null,
+    lastTime: row.last_time ? new Date(row.last_time) : null,
+    uniqueAddresses: Number.parseInt(row.unique_addresses, 10) || 0,
+  };
+};
+
+const queryChainDistribution = async ({ chainId, startTime, endTime }) => {
+  if (!storeEnabled || !storeReady) {
+    throw new Error('Persistent store unavailable');
+  }
+
+  const chainFilter = Array.isArray(chainId) ? chainId : [chainId];
+  const { clause, values } = buildFilterClause({ chainId: chainFilter, startTime, endTime });
+
+  const result = await withClient((client) => client.query(
+    `
+      WITH filtered AS (
+        SELECT *
+        FROM transfer_events
+        ${clause}
+      ),
+      unique_addresses AS (
+        SELECT
+          chain_id,
+          COUNT(DISTINCT address) AS unique_addresses
+        FROM (
+          SELECT chain_id, from_address AS address FROM filtered
+          UNION
+          SELECT chain_id, to_address AS address FROM filtered
+        ) participants
+        GROUP BY chain_id
+      )
+      SELECT
+        f.chain_id,
+        COUNT(*) AS transfer_count,
+  SUM(f.value::numeric) AS volume_raw,
+        COALESCE(u.unique_addresses, 0) AS unique_addresses
+      FROM filtered f
+      LEFT JOIN unique_addresses u ON u.chain_id = f.chain_id
+      GROUP BY f.chain_id, u.unique_addresses
+      ORDER BY SUM(f.value::numeric) DESC NULLS LAST;
+    `,
+    values
+  ));
+
+  return result.rows.map((row) => ({
+    chainId: Number.parseInt(row.chain_id, 10) || 0,
+    transferCount: Number.parseInt(row.transfer_count, 10) || 0,
+    volumeRaw: row.volume_raw || '0',
+    uniqueAddresses: Number.parseInt(row.unique_addresses, 10) || 0,
+  }));
+};
+
+const queryTopAddresses = async ({ chainId, startTime, endTime, limit = 20 }) => {
+  if (!storeEnabled || !storeReady) {
+    throw new Error('Persistent store unavailable');
+  }
+
+  const chainFilter = Array.isArray(chainId) ? chainId : [chainId];
+  const { clause, values } = buildFilterClause({ chainId: chainFilter, startTime, endTime });
+  const adjustedLimit = Math.max(1, Number.parseInt(limit, 10) || 20);
+
+  const result = await withClient((client) => client.query(
+    `
+      WITH filtered AS (
+        SELECT *
+        FROM transfer_events
+        ${clause}
+      ),
+      senders AS (
+        SELECT from_address AS address, COUNT(*) AS sent, SUM(value::numeric) AS sent_volume
+        FROM filtered
+        GROUP BY from_address
+      ),
+      receivers AS (
+        SELECT to_address AS address, COUNT(*) AS received, SUM(value::numeric) AS received_volume
+        FROM filtered
+        GROUP BY to_address
+      )
+      SELECT
+        COALESCE(s.address, r.address) AS address,
+        COALESCE(s.sent, 0) AS sent,
+        COALESCE(r.received, 0) AS received,
+  COALESCE(s.sent_volume, 0::NUMERIC) + COALESCE(r.received_volume, 0::NUMERIC) AS volume_raw,
+        COALESCE(s.sent, 0) + COALESCE(r.received, 0) AS total_txs
+      FROM senders s
+      FULL OUTER JOIN receivers r ON s.address = r.address
+      WHERE COALESCE(s.address, r.address) IS NOT NULL
+  ORDER BY total_txs DESC, (COALESCE(s.sent_volume, 0::NUMERIC) + COALESCE(r.received_volume, 0::NUMERIC)) DESC
+      LIMIT $${values.length + 1}::INT;
+    `,
+    [...values, adjustedLimit]
+  ));
+
+  return result.rows.map((row) => ({
+    address: row.address,
+    sent: Number.parseInt(row.sent, 10) || 0,
+    received: Number.parseInt(row.received, 10) || 0,
+    totalTxs: Number.parseInt(row.total_txs, 10) || 0,
+    volumeRaw: row.volume_raw || '0',
+  }));
+};
+
+const queryTopTransfers = async ({ chainId, startTime, endTime, limit = 20 }) => {
+  if (!storeEnabled || !storeReady) {
+    throw new Error('Persistent store unavailable');
+  }
+
+  const chainFilter = Array.isArray(chainId) ? chainId : [chainId];
+  const { clause, values } = buildFilterClause({ chainId: chainFilter, startTime, endTime });
+  const adjustedLimit = Math.max(1, Number.parseInt(limit, 10) || 20);
+
+  const result = await withClient((client) => client.query(
+    `
+      WITH filtered AS (
+        SELECT *
+        FROM transfer_events
+        ${clause}
+      )
+      SELECT
+        chain_id,
+        tx_hash,
+        from_address,
+        to_address,
+        value::numeric AS volume_raw,
+        EXTRACT(EPOCH FROM time_stamp) AS timestamp,
+        block_number,
+        log_index
+      FROM filtered
+      ORDER BY value::numeric DESC
+      LIMIT $${values.length + 1}::INT;
+    `,
+    [...values, adjustedLimit]
+  ));
+
+  return result.rows.map((row) => ({
+    chainId: Number.parseInt(row.chain_id, 10) || 0,
+    txHash: row.tx_hash,
+    from: row.from_address,
+    to: row.to_address,
+    volumeRaw: row.volume_raw || '0',
+    timestamp: row.timestamp ? Number(row.timestamp) : null,
+    blockNumber: Number.parseInt(row.block_number, 10) || null,
+    logIndex: Number.parseInt(row.log_index, 10) || null,
+  }));
+};
+
 const getPersistentStoreStatus = async () => {
   if (!storeEnabled) {
     return {
@@ -526,6 +780,11 @@ module.exports = {
   queryTransfersPage,
   countTransfers,
   getMaxTimestamp,
+  queryDailyAnalytics,
+  queryAnalyticsSummary,
+  queryChainDistribution,
+  queryTopAddresses,
+  queryTopTransfers,
   getPersistentStoreStatus,
   closePersistentStore,
 };
