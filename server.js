@@ -49,19 +49,19 @@ app.use(cors({
 app.use(express.json());
 
 // --- Rate Limiting ---
-// General API rate limiter
+// General API rate limiter - Increased for frontend normal usage
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
+  max: 500, // limit each IP to 500 requests per windowMs (allows ~33 req/min)
   message: { error: 'Too many requests from this IP, please try again later.' },
   standardHeaders: true,
   legacyHeaders: false,
 });
 
-// Strict rate limiter for expensive endpoints
+// Strict rate limiter for expensive endpoints (transfers with large page sizes)
 const strictLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
-  max: 10, // 10 requests per minute
+  max: 30, // 30 requests per minute for expensive operations
   message: { error: 'Rate limit exceeded. Please slow down your requests.' },
   standardHeaders: true,
   legacyHeaders: false,
