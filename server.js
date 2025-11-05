@@ -8,6 +8,8 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const NodeCache = require('node-cache');
 const compression = require('compression');
+const persistentStore = require('./src/persistentStore');
+const { startTransferIngestion } = require('./src/transfersIngestion');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -70,18 +72,22 @@ const strictLimiter = rateLimit({
 // Apply rate limiting to all API routes
 app.use('/api/', apiLimiter);
 
-// --- Constants ---
-// Support multiple API keys for load balancing
 const API_KEYS_RAW = process.env.ETHERSCAN_V2_API_KEY || '';
-const ETHERSCAN_API_KEYS = API_KEYS_RAW.includes(',') 
-  ? API_KEYS_RAW.split(',').map(k => k.trim()).filter(k => k.length > 0)
-  : [API_KEYS_RAW];
-const ETHERSCAN_API_KEY = ETHERSCAN_API_KEYS[0]; // Fallback for single key usage
+const ETHERSCAN_API_KEYS = (() => {
+  const keys = (API_KEYS_RAW.includes(',')
+    ? API_KEYS_RAW.split(',').map((value) => value.trim())
+    : [API_KEYS_RAW]).filter((value) => value.length > 0);
+  return keys.length > 0 ? keys : [''];
+})();
+const ETHERSCAN_API_KEY = ETHERSCAN_API_KEYS[0] || '';
 let currentKeyIndex = 0;
 
-// Function to get next API key (round-robin)
 const getNextApiKey = () => {
-  const key = ETHERSCAN_API_KEYS[currentKeyIndex];
+  if (ETHERSCAN_API_KEYS.length === 0) {
+    return '';
+  }
+
+  const key = ETHERSCAN_API_KEYS[currentKeyIndex] || '';
   currentKeyIndex = (currentKeyIndex + 1) % ETHERSCAN_API_KEYS.length;
   return key;
 };
@@ -113,40 +119,51 @@ const PROVIDERS = {
 console.log(`i API Base URL: ${API_V2_BASE_URL}`);
 console.log(`i Cronos API Base URL: ${CRONOS_API_BASE_URL}`);
 
-// --- Caching Middleware ---
-/**
- * Generic caching middleware using NodeCache
- * @param {number} duration - Cache duration in seconds
- */
-const cacheMiddleware = (duration) => (req, res, next) => {
-  // Only cache GET requests
-  if (req.method !== 'GET') {
-    return next();
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+const TRANSFER_EVENT_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const CRONOS_MAX_LOG_BLOCK_RANGE = Number(process.env.CRONOS_LOG_BLOCK_RANGE || 9_999);
+const CRONOS_MAX_LOG_ITERATIONS = Number(process.env.CRONOS_LOG_MAX_ITERATIONS || 12);
+const CRONOS_TOTAL_MAX_ITERATIONS = Number(process.env.CRONOS_TOTAL_LOG_MAX_ITERATIONS || 60);
+const BZR_TOKEN_NAME = process.env.BZR_TOKEN_NAME || 'Bazaars';
+const BZR_TOKEN_SYMBOL = process.env.BZR_TOKEN_SYMBOL || 'BZR';
+const BZR_TOKEN_DECIMALS = Number(process.env.BZR_TOKEN_DECIMALS || 18);
+const HEX_PREFIX = /^0x/i;
+
+const normalizeHex = (value) => {
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      return '0x0';
+    }
+    return `0x${value.toString(16)}`;
   }
-  
-  const key = req.originalUrl || req.url;
-  const cachedResponse = apiCache.get(key);
-  
-  if (cachedResponse) {
-    console.log(`[CACHE HIT] ${key}`);
-    return res.json(cachedResponse);
+
+  if (typeof value === 'bigint') {
+    return `0x${value.toString(16)}`;
   }
-  
-  console.log(`[CACHE MISS] ${key}`);
-  
-  // Store the original res.json to intercept the response
-  res.originalJson = res.json;
-  res.json = function(data) {
-    // Cache the response
-    apiCache.set(key, data, duration);
-    // Call the original res.json
-    res.originalJson(data);
-  };
-  
-  next();
+
+  if (typeof value === 'string') {
+    return HEX_PREFIX.test(value) ? value : `0x${value}`;
+  }
+
+  return '0x0';
 };
 
-// [Milestone 2.2] Define all 10 chains
+const hexToBigInt = (value) => {
+  try {
+    return BigInt(normalizeHex(value));
+  } catch (error) {
+    return BigInt(0);
+  }
+};
+
+const hexToDecimalString = (value) => hexToBigInt(value).toString(10);
+
+const hexToNumberSafe = (value) => {
+  const normalized = normalizeHex(value);
+  const parsed = Number.parseInt(normalized, 16);
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
 const CHAINS = [
   { id: 1, name: 'Ethereum', provider: 'etherscan' },
   { id: 10, name: 'Optimism', provider: 'etherscan' },
@@ -185,7 +202,6 @@ const buildProviderRequest = (chain, params = {}, options = {}) => {
   const nextParams = { ...params };
 
   if (includeApiKey) {
-    // Use rotating API key for etherscan provider
     if (provider.key === 'etherscan') {
       nextParams.apikey = getNextApiKey();
     } else {
@@ -203,51 +219,28 @@ const buildProviderRequest = (chain, params = {}, options = {}) => {
   };
 };
 
-const isCronosChain = (chain) => getProviderKeyForChain(chain) === 'cronos';
-
-const HEX_PREFIX = /^0x/i;
-const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
-const TRANSFER_EVENT_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
-const CRONOS_MAX_LOG_BLOCK_RANGE = Number(process.env.CRONOS_LOG_BLOCK_RANGE || 9_999);
-const CRONOS_MAX_LOG_ITERATIONS = Number(process.env.CRONOS_LOG_MAX_ITERATIONS || 12);
-const CRONOS_TOTAL_MAX_ITERATIONS = Number(process.env.CRONOS_TOTAL_LOG_MAX_ITERATIONS || 60);
-const BZR_TOKEN_NAME = process.env.BZR_TOKEN_NAME || 'Bazaars';
-const BZR_TOKEN_SYMBOL = process.env.BZR_TOKEN_SYMBOL || 'BZR';
-const BZR_TOKEN_DECIMALS = Number(process.env.BZR_TOKEN_DECIMALS || 18);
-
-const normalizeHex = (value) => {
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) {
-      return '0x0';
-    }
-    return `0x${value.toString(16)}`;
+const cacheMiddleware = (duration) => (req, res, next) => {
+  if (req.method !== 'GET') {
+    return next();
   }
 
-  if (typeof value === 'bigint') {
-    return `0x${value.toString(16)}`;
+  const key = req.originalUrl || req.url;
+  const cachedResponse = apiCache.get(key);
+
+  if (cachedResponse) {
+    console.log(`[CACHE HIT] ${key}`);
+    return res.json(cachedResponse);
   }
 
-  if (typeof value === 'string') {
-    return HEX_PREFIX.test(value) ? value : `0x${value}`;
-  }
+  console.log(`[CACHE MISS] ${key}`);
 
-  return '0x0';
-};
+  res.originalJson = res.json;
+  res.json = function (data) {
+    apiCache.set(key, data, duration);
+    res.originalJson(data);
+  };
 
-const hexToBigInt = (value) => {
-  try {
-    return BigInt(normalizeHex(value));
-  } catch (error) {
-    return BigInt(0);
-  }
-};
-
-const hexToDecimalString = (value) => hexToBigInt(value).toString(10);
-
-const hexToNumberSafe = (value) => {
-  const normalized = normalizeHex(value);
-  const parsed = Number.parseInt(normalized, 16);
-  return Number.isFinite(parsed) ? parsed : 0;
+  next();
 };
 
 const topicToAddress = (topic) => {
@@ -279,6 +272,10 @@ const cache = {
   finality: null,
   finalityTimestamp: 0,
 };
+
+let transferIngestionController = null;
+let persistentStoreReady = false;
+let persistentStoreInitError = null;
 
 const FIVE_MINUTES = 5 * 60 * 1000;
 
@@ -315,6 +312,9 @@ const TRANSFERS_MAX_PAGE_SIZE = Number(process.env.TRANSFERS_MAX_PAGE_SIZE || 10
 const TRANSFERS_PAGE_TTL_MS = Number(process.env.TRANSFERS_PAGE_TTL_MS || TWO_MINUTES);
 const TRANSFERS_TOTAL_TTL_MS = Number(process.env.TRANSFERS_TOTAL_TTL_MS || 15 * 60 * 1000);
 const TRANSFERS_TOTAL_FETCH_LIMIT = Number(process.env.TRANSFERS_TOTAL_FETCH_LIMIT || 25_000);
+const TRANSFERS_DATA_SOURCE = (process.env.TRANSFERS_DATA_SOURCE || 'upstream').toLowerCase();
+const USE_PERSISTENT_TRANSFERS = TRANSFERS_DATA_SOURCE === 'persistent';
+const PERSISTENT_STORE_BOOTSTRAP_TIMEOUT_MS = Number(process.env.PERSISTENT_STORE_BOOTSTRAP_TIMEOUT_MS || 15_000);
 const ETHERSCAN_RESULT_WINDOW = Number(process.env.ETHERSCAN_RESULT_WINDOW || 10_000);
 
 const toNumericTimestamp = (timestamp) => {
@@ -457,6 +457,34 @@ const getCachedTransfersWarmSummary = () => {
   return {
     chains: Array.isArray(cache.transfersWarmStatus) ? cache.transfersWarmStatus : [],
     timestamp: cache.transfersWarmTimestamp || null,
+  };
+};
+
+const getPersistentWarmSummary = async () => {
+  if (!persistentStoreReady || !persistentStore.isPersistentStoreReady()) {
+    return {
+      chains: [],
+      timestamp: null,
+    };
+  }
+
+  const summary = await persistentStore.getLatestIngestSummary();
+  const now = Date.now();
+  const chains = summary.map((entry) => {
+    const chain = getChainDefinition(entry.chainId) || { name: `Chain ${entry.chainId}` };
+    return {
+      chainId: entry.chainId,
+      chainName: chain.name,
+      lastBlockNumber: entry.lastBlockNumber || null,
+      lastTime: entry.lastTime ? new Date(entry.lastTime).toISOString() : null,
+      lagSeconds: typeof entry.lagSeconds === 'number' ? entry.lagSeconds : null,
+      updatedAt: entry.updatedAt ? new Date(entry.updatedAt).toISOString() : null,
+    };
+  });
+
+  return {
+    chains,
+    timestamp: now,
   };
 };
 
@@ -902,6 +930,86 @@ const handleAggregatedTransfers = async (req, res, options) => {
   console.log('-> Fetching aggregated transfers from all chains...');
 
   try {
+    const coerceTotal = (raw) => {
+      const numeric = Number(raw);
+      return Number.isFinite(numeric) && numeric >= 0 ? numeric : 0;
+    };
+
+    const totalsPromise = mapWithConcurrency(
+      CHAINS,
+      MAX_CONCURRENT_REQUESTS,
+      async (chain) => {
+        const cacheKey = buildTransfersTotalCacheKey({
+          chainId: chain.id,
+          startBlock: undefined,
+          endBlock: undefined,
+        });
+
+        const summary = {
+          chainId: chain.id,
+          chainName: chain.name,
+          total: null,
+          available: false,
+          stale: false,
+          source: null,
+          truncated: false,
+          windowCapped: false,
+          error: null,
+          errorCode: null,
+        };
+
+        const cached = getCachedTransfersTotal(cacheKey);
+
+        if (cached?.payload) {
+          const hasCachedTotal = typeof cached.payload.total !== 'undefined';
+          summary.total = hasCachedTotal ? coerceTotal(cached.payload.total) : null;
+          summary.available = hasCachedTotal;
+          summary.stale = Boolean(cached.stale);
+          summary.source = cached.stale ? 'stale-cache' : 'cache';
+          summary.truncated = Boolean(cached.payload.truncated);
+          summary.windowCapped = Boolean(cached.payload.windowCapped);
+        }
+
+        const shouldFetchTotals = forceRefresh || !cached?.payload || cached.stale;
+
+        if (shouldFetchTotals) {
+          try {
+            const resolved = await resolveTransfersTotalData({
+              chain,
+              sort,
+              startBlock: undefined,
+              endBlock: undefined,
+              forceRefresh,
+            });
+
+            const hasResolvedTotal = typeof resolved.total !== 'undefined';
+            summary.total = hasResolvedTotal ? coerceTotal(resolved.total) : null;
+            summary.available = hasResolvedTotal;
+            summary.stale = Boolean(resolved.stale);
+            summary.source = resolved.source || 'network';
+            summary.truncated = Boolean(resolved.truncated);
+            summary.windowCapped = Boolean(resolved.windowCapped);
+            summary.error = null;
+            summary.errorCode = null;
+          } catch (error) {
+            console.warn(`! Could not fetch totals for ${chain.name}: ${error.message || error}`);
+            summary.error = error.message || String(error);
+            summary.errorCode = error.code || null;
+            if (!summary.available) {
+              summary.source = 'unavailable';
+            }
+          }
+        }
+
+        if (summary.available && summary.total === null) {
+          summary.total = 0;
+        }
+
+        summary.available = summary.total !== null && summary.available;
+        return summary;
+      }
+    );
+
     // Fetch first page from all chains in parallel
     const results = await mapWithConcurrency(
       CHAINS,
@@ -920,7 +1028,9 @@ const handleAggregatedTransfers = async (req, res, options) => {
           return { chain, data: pageData, error: null };
         } catch (error) {
           console.warn(`! Failed to fetch transfers from ${chain.name}: ${error.message || error}`);
-          return { chain, data: null, error };
+          const debugStack = error?.stack || error;
+          console.warn('[AggregatedTransfers] debug stack:', debugStack);
+          return { chain, data: null, error, stack: debugStack };
         }
       }
     );
@@ -930,35 +1040,67 @@ const handleAggregatedTransfers = async (req, res, options) => {
     const chainSummaries = [];
     let displayCount = 0; // Count of transfers fetched for display
     let allTimeTotal = 0; // True all-time total from cached individual chain totals
-    let allTimeTotalAvailable = true;
 
-    // Fetch cached totals from each chain for all-time stats
-    const chainTotalsPromises = CHAINS.map(async (chain) => {
-      try {
-        const cacheKey = buildTransfersTotalCacheKey({
-          chainId: chain.id,
-          startBlock: undefined,
-          endBlock: undefined,
-        });
-        const cached = getCachedTransfersTotal(cacheKey);
-        return cached?.payload?.total || 0;
-      } catch (error) {
-        console.warn(`! Could not get cached total for ${chain.name}`);
-        return 0;
+    const totalsResults = await totalsPromise;
+    const totalsByChainId = new Map();
+    const totalsMissingChains = [];
+
+    totalsResults.forEach((result, index) => {
+      const chain = CHAINS[index];
+
+      if (result.status === 'fulfilled') {
+        const summary = result.value;
+        const summaryChainId = typeof summary.chainId === 'number' ? summary.chainId : chain?.id;
+        const summaryChainName = summary.chainName || chain?.name || `Chain ${summaryChainId ?? index}`;
+
+        const normalizedSummary = {
+          chainId: summaryChainId,
+          chainName: summaryChainName,
+          total: summary.total,
+          available: summary.available,
+          stale: Boolean(summary.stale),
+          source: summary.source || null,
+          truncated: Boolean(summary.truncated),
+          windowCapped: Boolean(summary.windowCapped),
+          error: summary.error || null,
+          errorCode: summary.errorCode || null,
+        };
+
+        totalsByChainId.set(summaryChainId, normalizedSummary);
+
+        if (normalizedSummary.available) {
+          allTimeTotal += normalizedSummary.total || 0;
+        } else {
+          totalsMissingChains.push(normalizedSummary.chainName);
+        }
+      } else {
+        const fallbackChainId = chain?.id ?? index;
+        const fallbackChainName = chain?.name || `Chain ${fallbackChainId}`;
+
+        const fallbackSummary = {
+          chainId: fallbackChainId,
+          chainName: fallbackChainName,
+          total: null,
+          available: false,
+          stale: false,
+          source: 'unavailable',
+          truncated: false,
+          windowCapped: false,
+          error: result.reason?.message || String(result.reason || 'Totals fetch failed'),
+          errorCode: result.reason?.code || null,
+        };
+
+        totalsByChainId.set(fallbackSummary.chainId, fallbackSummary);
+        totalsMissingChains.push(fallbackSummary.chainName);
       }
     });
 
-    const chainTotals = await Promise.all(chainTotalsPromises);
-    allTimeTotal = chainTotals.reduce((sum, total) => sum + (total || 0), 0);
-    
-    // If no cached totals available, mark as unavailable
-    if (allTimeTotal === 0) {
-      allTimeTotalAvailable = false;
-    }
+    const allTimeTotalAvailable = totalsMissingChains.length === 0;
 
     results.forEach((result) => {
       if (result.status === 'fulfilled' && result.value.data) {
         const { chain, data } = result.value;
+        const totalsMeta = totalsByChainId.get(chain.id);
         allTransfers.push(...(data.transfers || []));
         chainSummaries.push({
           chainId: chain.id,
@@ -967,9 +1109,22 @@ const handleAggregatedTransfers = async (req, res, options) => {
           transferCount: (data.transfers || []).length,
           durationMs: 0,
           timestamp: data.timestamp || Date.now(),
+          totals: totalsMeta
+            ? {
+                available: totalsMeta.available,
+                total: totalsMeta.available ? totalsMeta.total : null,
+                source: totalsMeta.source,
+                stale: Boolean(totalsMeta.stale),
+                truncated: Boolean(totalsMeta.truncated),
+                windowCapped: Boolean(totalsMeta.windowCapped),
+                error: totalsMeta.error,
+                errorCode: totalsMeta.errorCode,
+              }
+            : undefined,
         });
       } else if (result.status === 'fulfilled' && result.value.error) {
         const { chain, error } = result.value;
+        const totalsMeta = totalsByChainId.get(chain.id);
         chainSummaries.push({
           chainId: chain.id,
           chainName: chain.name,
@@ -979,6 +1134,19 @@ const handleAggregatedTransfers = async (req, res, options) => {
           errorCode: error.code || null,
           durationMs: 0,
           timestamp: Date.now(),
+          stack: result.value.stack || null,
+          totals: totalsMeta
+            ? {
+                available: totalsMeta.available,
+                total: totalsMeta.available ? totalsMeta.total : null,
+                source: totalsMeta.source,
+                stale: Boolean(totalsMeta.stale),
+                truncated: Boolean(totalsMeta.truncated),
+                windowCapped: Boolean(totalsMeta.windowCapped),
+                error: totalsMeta.error,
+                errorCode: totalsMeta.errorCode,
+              }
+            : undefined,
         });
       }
     });
@@ -1001,12 +1169,18 @@ const handleAggregatedTransfers = async (req, res, options) => {
 
     const warmSummary = getCachedTransfersWarmSummary();
     const warnings = [];
-    
+
     if (!allTimeTotalAvailable) {
+      const missingCount = totalsMissingChains.filter(Boolean).length;
+      const readyCount = Math.max(0, CHAINS.length - missingCount);
+      const message = readyCount > 0
+        ? `All-time transfer totals still warming (${readyCount}/${CHAINS.length} chains ready).`
+        : 'All-time transfer totals not yet cached. Displaying current page data only.';
+
       warnings.push({
         scope: 'total',
         code: 'ALL_TIME_TOTAL_UNAVAILABLE',
-        message: 'All-time transfer totals not yet cached. Displaying current page data only.',
+        message,
         retryable: true,
       });
     }
@@ -1078,6 +1252,203 @@ const handleAggregatedTransfers = async (req, res, options) => {
   }
 };
 
+const handlePersistentTransfers = async (req, res, options) => {
+  const {
+    requestedChainId,
+    requestedPage,
+    requestedPageSize,
+    sort,
+    startBlock,
+    endBlock,
+    includeTotals,
+  } = options;
+
+  if (!persistentStoreReady || !persistentStore.isPersistentStoreReady()) {
+    const reason = persistentStoreInitError ? persistentStoreInitError.message : 'Persistent store not ready';
+    return res.status(503).json({
+      message: 'Persistent transfers store not ready',
+      source: 'store',
+      reason,
+    });
+  }
+
+  try {
+    if (requestedChainId !== 0 && !getChainDefinition(requestedChainId)) {
+      return res.status(400).json({
+        message: 'Unsupported chain requested',
+        chainId: requestedChainId,
+        availableChains: CHAINS.map((chain) => ({ id: chain.id, name: chain.name })),
+      });
+    }
+
+    const chainIds = requestedChainId === 0
+      ? CHAINS.map((chain) => chain.id)
+      : [requestedChainId];
+
+    const pageData = await persistentStore.queryTransfersPage({
+      chainId: chainIds,
+      page: requestedPage,
+      pageSize: requestedPageSize,
+      sort,
+      startBlock,
+      endBlock,
+    });
+
+    const totalCount = includeTotals
+      ? await persistentStore.countTransfers({ chainId: chainIds, startBlock, endBlock })
+      : pageData.resultLength;
+
+    const totalPages = totalCount > 0
+      ? Math.ceil(totalCount / requestedPageSize)
+      : (pageData.resultLength === requestedPageSize ? requestedPage + 1 : requestedPage);
+
+    const hasMore = totalCount > requestedPage * requestedPageSize;
+    const { lastTime, lagSeconds } = await persistentStore.getMaxTimestamp({ chainId: chainIds });
+    const warmSummary = await getPersistentWarmSummary();
+
+    const warnings = [];
+    if (typeof lagSeconds === 'number' && lagSeconds > 600) {
+      warnings.push({
+        scope: 'store',
+        code: 'INGEST_LAG',
+        message: `Transfer ingestion is ${lagSeconds} seconds behind.`,
+        retryable: false,
+      });
+    }
+
+    const chainMeta = requestedChainId === 0
+      ? { id: 0, name: 'All Chains' }
+      : (() => {
+          const chain = getChainDefinition(requestedChainId);
+          return chain ? { id: chain.id, name: chain.name } : { id: requestedChainId, name: `Chain ${requestedChainId}` };
+        })();
+
+    const responseChains = warmSummary.chains.map((entry) => ({
+      chainId: entry.chainId,
+      chainName: entry.chainName,
+      lagSeconds: entry.lagSeconds,
+      lastBlockNumber: entry.lastBlockNumber,
+      lastTime: entry.lastTime,
+      updatedAt: entry.updatedAt,
+    }));
+
+    res.json({
+      data: Array.isArray(pageData.transfers) ? pageData.transfers : [],
+      pagination: {
+        page: requestedPage,
+        pageSize: requestedPageSize,
+        total: totalCount,
+        totalPages,
+        hasMore,
+        windowExceeded: false,
+        maxWindowPages: null,
+        resultWindow: null,
+      },
+      totals: includeTotals
+        ? {
+            total: totalCount,
+            truncated: false,
+            resultLength: totalCount,
+            timestamp: Date.now(),
+            stale: false,
+            source: 'store',
+          }
+        : null,
+      chain: chainMeta,
+      sort,
+      filters: {
+        startBlock: typeof startBlock === 'number' ? startBlock : null,
+        endBlock: typeof endBlock === 'number' ? endBlock : null,
+      },
+      timestamp: Date.now(),
+      stale: false,
+      source: 'store',
+      warnings,
+      limits: {
+        maxPageSize: TRANSFERS_MAX_PAGE_SIZE,
+        totalFetchLimit: TRANSFERS_TOTAL_FETCH_LIMIT,
+        resultWindow: null,
+      },
+      defaults: {
+        chainId: TRANSFERS_DEFAULT_CHAIN_ID,
+        pageSize: TRANSFERS_DEFAULT_PAGE_SIZE,
+        sort: 'desc',
+      },
+      warm: {
+        chains: responseChains,
+        timestamp: warmSummary.timestamp,
+        source: 'store',
+      },
+      chains: responseChains,
+      availableChains: [{ id: 0, name: 'All Chains' }, ...CHAINS.map((c) => ({ id: c.id, name: c.name }))],
+      freshness: {
+        lastIngestedAt: lastTime ? lastTime.toISOString() : null,
+        ingestLagSeconds: lagSeconds,
+      },
+      request: {
+        includeTotals,
+        dataSource: 'store',
+      },
+    });
+  } catch (error) {
+    console.error('X Persistent transfers handler failed:', error.message || error);
+    return res.status(500).json({
+      message: 'Failed to read transfers from persistent store',
+      error: error.message || String(error),
+    });
+  }
+};
+
+const fetchPageForIngestion = async ({ chain, page, pageSize, sort }) => {
+  return fetchTransfersPageFromChain({
+    chain,
+    page,
+    pageSize,
+    sort,
+  });
+};
+
+const bootstrapPersistentStore = async () => {
+  try {
+    const status = await persistentStore.initPersistentStore();
+    persistentStoreReady = Boolean(status.ready);
+    persistentStoreInitError = status.error || (status.reason ? new Error(status.reason) : null);
+
+    if (!status.enabled) {
+      console.log('! Persistent store disabled (no database configuration).');
+      return;
+    }
+
+    if (!status.ready) {
+      console.warn('! Persistent store initialization incomplete. Transfers will continue using upstream APIs until ready.');
+      if (USE_PERSISTENT_TRANSFERS) {
+        setTimeout(() => {
+          if (!persistentStoreReady) {
+            console.error('X Persistent store still not ready after initialization timeout.');
+          }
+        }, PERSISTENT_STORE_BOOTSTRAP_TIMEOUT_MS);
+      }
+      return;
+    }
+
+    if (transferIngestionController) {
+      transferIngestionController.stop();
+      transferIngestionController = null;
+    }
+
+    transferIngestionController = startTransferIngestion({
+      chains: CHAINS,
+      fetchPage: fetchPageForIngestion,
+    });
+
+    console.log('✓ Persistent transfer ingestion pipeline started.');
+  } catch (error) {
+    persistentStoreReady = false;
+    persistentStoreInitError = error;
+    console.error('X Persistent store bootstrap failed:', error.message || error);
+  }
+};
+
 /**
  * [Milestone 2.2]
  * Fetches ERC-20 token transfers for a single chain.
@@ -1085,7 +1456,7 @@ const handleAggregatedTransfers = async (req, res, options) => {
  * @returns {Promise<Array>} A promise that resolves to an array of transactions.
  */
 const fetchTransfersPageFromChain = async ({ chain, page, pageSize, sort, startBlock, endBlock }) => {
-  if (isCronosChain(chain)) {
+  if (getProviderKeyForChain(chain) === 'cronos') {
     return fetchCronosTransfersPage({
       chain,
       page,
@@ -1185,7 +1556,7 @@ const fetchTransfersPageFromChain = async ({ chain, page, pageSize, sort, startB
 };
 
 const fetchTransfersTotalCount = async ({ chain, sort, startBlock, endBlock }) => {
-  if (isCronosChain(chain)) {
+  if (getProviderKeyForChain(chain) === 'cronos') {
     return fetchCronosTransfersTotalCount({
       chain,
       startBlock,
@@ -1505,7 +1876,7 @@ const resolveTransfersTotalData = async ({
  * @returns {Promise<object>} A promise that resolves to a stats object.
  */
 const fetchStatsForChain = async (chain) => {
-  if (isCronosChain(chain)) {
+  if (getProviderKeyForChain(chain) === 'cronos') {
     console.warn('! Cronos tokenholdercount endpoint unavailable – defaulting to 0');
     return { chainName: chain.name, chainId: chain.id, holderCount: 0, unsupported: true };
   }
@@ -2078,6 +2449,24 @@ app.get('/api/info', strictLimiter, cacheMiddleware(300), async (req, res) => {
   }
 });
 
+const shutdown = async () => {
+  console.log('-> Shutting down backend...');
+  try {
+    if (transferIngestionController && typeof transferIngestionController.stop === 'function') {
+      transferIngestionController.stop();
+      transferIngestionController = null;
+    }
+    await persistentStore.closePersistentStore();
+  } catch (error) {
+    console.error('X Error during shutdown:', error.message || error);
+  } finally {
+    process.exit(0);
+  }
+};
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+
 
 // [Milestone 2.2] - All Transfers (Implementation)
 app.get('/api/transfers', async (req, res) => {
@@ -2108,6 +2497,18 @@ app.get('/api/transfers', async (req, res) => {
   // Special handling for "All Chains" aggregation (chainId = 0)
   const isAggregatedView = requestedChainId === 0;
 
+  if (USE_PERSISTENT_TRANSFERS) {
+    return handlePersistentTransfers(req, res, {
+      requestedChainId,
+      requestedPage,
+      requestedPageSize,
+      sort,
+      startBlock,
+      endBlock,
+      includeTotals,
+    });
+  }
+
   if (isAggregatedView) {
     return handleAggregatedTransfers(req, res, {
       forceRefresh,
@@ -2135,7 +2536,7 @@ app.get('/api/transfers', async (req, res) => {
     return res.status(500).json({ message: providerError.message });
   }
 
-  const chainIsCronos = isCronosChain(chain);
+  const chainIsCronos = getProviderKeyForChain(chain) === 'cronos';
   const resultWindowLimit = !chainIsCronos && Number.isFinite(ETHERSCAN_RESULT_WINDOW)
     ? Math.max(0, ETHERSCAN_RESULT_WINDOW)
     : null;
@@ -2362,7 +2763,11 @@ app.get('/api/stats', async (req, res) => {
         allStats.push(result.value);
         totalHolders += result.value.holderCount;
       } else if (result.status === 'rejected') {
-        console.error(`X Critical error fetching stats from ${CHAINS[index].name}: ${result.reason}`);
+        const reason = result.reason;
+        const stack = reason?.stack || reason;
+        console.error(`X Critical error fetching stats from ${CHAINS[index].name}:`, reason);
+        console.error('[Stats] reason typeof:', typeof reason, 'stack typeof:', typeof stack);
+        console.error('[Stats] stack trace output:', stack);
       }
     });
 
@@ -2421,7 +2826,7 @@ app.get('/api/holders', strictLimiter, cacheMiddleware(180), async (req, res) =>
   }
 
   // Cronos doesn't support tokenholderlist
-  if (isCronosChain(chain)) {
+  if (getProviderKeyForChain(chain) === 'cronos') {
     return res.status(501).json({
       message: 'Cronos chain does not support token holder list',
       chainId: requestedChainId,
@@ -2481,7 +2886,7 @@ app.get('/api/holders', strictLimiter, cacheMiddleware(180), async (req, res) =>
   }
 });
 
-app.get('/api/cache-health', (req, res) => {
+app.get('/api/cache-health', async (req, res) => {
   const now = Date.now();
 
   const withMeta = (data, timestamp, ttl) => {
@@ -2493,7 +2898,6 @@ app.get('/api/cache-health', (req, res) => {
         expiresInMs: null,
       };
     }
-
     const age = now - timestamp;
     return {
       status: age < ttl ? 'fresh' : 'stale',
@@ -2503,9 +2907,65 @@ app.get('/api/cache-health', (req, res) => {
     };
   };
 
+  const transfersWarmMeta = withMeta(cache.transfersWarmStatus, cache.transfersWarmTimestamp, TWO_MINUTES);
+  const warmSummary = getCachedTransfersWarmSummary();
+
+  let persistentStatus = {
+    enabled: typeof persistentStore.isPersistentStoreEnabled === 'function'
+      ? persistentStore.isPersistentStoreEnabled()
+      : false,
+    ready: typeof persistentStore.isPersistentStoreReady === 'function'
+      ? persistentStore.isPersistentStoreReady()
+      : false,
+    summary: [],
+    reason: null,
+    error: null,
+  };
+
+  try {
+    const status = await persistentStore.getPersistentStoreStatus();
+    if (status) {
+      persistentStatus = {
+        enabled: Boolean(status.enabled),
+        ready: Boolean(status.ready),
+        summary: Array.isArray(status.summary) ? status.summary : [],
+        reason: status.reason || null,
+        error: null,
+      };
+    }
+  } catch (error) {
+    persistentStatus = {
+      ...persistentStatus,
+      error: error.message || String(error),
+    };
+  }
+
+  if (!persistentStatus.ready && persistentStoreInitError) {
+    persistentStatus = {
+      ...persistentStatus,
+      error: persistentStatus.error || persistentStoreInitError.message,
+    };
+  }
+
+  let persistentWarmSummary = { chains: [], timestamp: null };
+  try {
+    persistentWarmSummary = await getPersistentWarmSummary();
+  } catch (error) {
+    persistentWarmSummary = {
+      chains: [],
+      timestamp: null,
+      error: error.message || String(error),
+    };
+  }
+
   res.json({
     info: withMeta(cache.info, cache.infoTimestamp, FIVE_MINUTES),
-    transfersWarm: withMeta(cache.transfersWarmStatus, cache.transfersWarmTimestamp, TWO_MINUTES),
+    transfersWarm: {
+      ...transfersWarmMeta,
+      chains: warmSummary.chains,
+      timestamp: warmSummary.timestamp,
+      refreshInFlight: Boolean(transfersRefreshPromise),
+    },
     transferWarmChains: cache.transfersWarmStatus,
     stats: withMeta(cache.stats, cache.statsTimestamp, TWO_MINUTES),
     tokenPrice: {
@@ -2519,6 +2979,25 @@ app.get('/api/cache-health', (req, res) => {
       ...withMeta(cache.finality, cache.finalityTimestamp, FINALITY_TTL_MS),
       blockNumber: cache.finality?.blockNumber ?? null,
       blockNumberHex: cache.finality?.blockNumberHex ?? null,
+    },
+    transfersCache: {
+      pageEntries: cache.transfersPageCache.size,
+      totalEntries: cache.transfersTotalCache.size,
+    },
+    inflight: {
+      pageRequests: transfersPagePromises.size,
+      totalRequests: transfersTotalPromises.size,
+      warmRefresh: Boolean(transfersRefreshPromise),
+    },
+    persistentStore: {
+      ...persistentStatus,
+      initialized: persistentStoreReady,
+      initError: persistentStoreInitError ? persistentStoreInitError.message : null,
+      warm: persistentWarmSummary,
+    },
+    ingestion: {
+      running: Boolean(transferIngestionController),
+      enabled: Boolean(transferIngestionController) && persistentStatus.ready,
     },
     serverTime: new Date(now).toISOString(),
   });
@@ -2581,8 +3060,8 @@ app.post('/api/cache/invalidate', (req, res) => {
   cache.statsTimestamp = 0;
   cache.tokenPrice = null;
   cache.tokenPriceTimestamp = 0;
-  cache.finalizedBlock = null;
-  cache.finalizedBlockTimestamp = 0;
+  cache.finality = null;
+  cache.finalityTimestamp = 0;
   
   // Clear transfers caches
   cache.transfersPageCache.clear();
