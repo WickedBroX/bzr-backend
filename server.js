@@ -4,13 +4,71 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const NodeCache = require('node-cache');
+const compression = require('compression');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// --- Middleware ---
-app.use(cors());
+// --- Cache Setup ---
+const apiCache = new NodeCache({ stdTTL: 60, checkperiod: 120 }); // Default 60s TTL for new caching
+
+// --- Security Middleware ---
+// Helmet for security headers
+app.use(helmet({
+  contentSecurityPolicy: false, // Disable CSP for API
+  crossOriginEmbedderPolicy: false,
+}));
+
+// Compression for response optimization
+app.use(compression());
+
+// CORS with origin restrictions
+const allowedOrigins = process.env.ALLOWED_ORIGINS 
+  ? process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim())
+  : ['http://localhost:5173', 'http://localhost:3000'];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, Postman, etc.)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.indexOf(origin) !== -1 || allowedOrigins.includes('*')) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST'],
+  maxAge: 86400 // 24 hours
+}));
+
 app.use(express.json());
+
+// --- Rate Limiting ---
+// General API rate limiter
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: { error: 'Too many requests from this IP, please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Strict rate limiter for expensive endpoints
+const strictLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 10, // 10 requests per minute
+  message: { error: 'Rate limit exceeded. Please slow down your requests.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Apply rate limiting to all API routes
+app.use('/api/', apiLimiter);
 
 // --- Constants ---
 const ETHERSCAN_API_KEY = process.env.ETHERSCAN_V2_API_KEY;
@@ -38,6 +96,39 @@ const PROVIDERS = {
 
 console.log(`i API Base URL: ${API_V2_BASE_URL}`);
 console.log(`i Cronos API Base URL: ${CRONOS_API_BASE_URL}`);
+
+// --- Caching Middleware ---
+/**
+ * Generic caching middleware using NodeCache
+ * @param {number} duration - Cache duration in seconds
+ */
+const cacheMiddleware = (duration) => (req, res, next) => {
+  // Only cache GET requests
+  if (req.method !== 'GET') {
+    return next();
+  }
+  
+  const key = req.originalUrl || req.url;
+  const cachedResponse = apiCache.get(key);
+  
+  if (cachedResponse) {
+    console.log(`[CACHE HIT] ${key}`);
+    return res.json(cachedResponse);
+  }
+  
+  console.log(`[CACHE MISS] ${key}`);
+  
+  // Store the original res.json to intercept the response
+  res.originalJson = res.json;
+  res.json = function(data) {
+    // Cache the response
+    apiCache.set(key, data, duration);
+    // Call the original res.json
+    res.originalJson(data);
+  };
+  
+  next();
+};
 
 // [Milestone 2.2] Define all 10 chains
 const CHAINS = [
@@ -1841,7 +1932,7 @@ const fetchFinalizedBlock = async () => {
 // --- API Routes ---
 
 // [Milestone 2.1] - Token Info
-app.get('/api/info', async (req, res) => {
+app.get('/api/info', strictLimiter, cacheMiddleware(300), async (req, res) => {
   console.log(`[${new Date().toISOString()}] Received request for /api/info`);
   const now = Date.now();
   if (cache.info && (now - cache.infoTimestamp < FIVE_MINUTES)) {
@@ -2279,7 +2370,7 @@ app.get('/api/stats', async (req, res) => {
 });
 
 // [Phase 2.1] - Token Holders List
-app.get('/api/holders', async (req, res) => {
+app.get('/api/holders', strictLimiter, cacheMiddleware(180), async (req, res) => {
   console.log(`[${new Date().toISOString()}] Received request for /api/holders`);
   
   if (!BZR_ADDRESS) {
@@ -2403,7 +2494,7 @@ app.get('/api/cache-health', (req, res) => {
   });
 });
 
-app.get('/api/token-price', async (req, res) => {
+app.get('/api/token-price', cacheMiddleware(60), async (req, res) => {
   const now = Date.now();
   if (cache.tokenPrice && (now - cache.tokenPriceTimestamp) < TOKEN_PRICE_TTL_MS) {
     return res.json(cache.tokenPrice);
@@ -2501,7 +2592,9 @@ app.listen(PORT, () => {
     console.warn('The API calls will fail until this is set.');
     console.warn('---');
   } else {
-    console.log('Etherscan API key loaded successfully.');
+    // Mask API key in logs for security
+    const maskedKey = '***' + ETHERSCAN_API_KEY.slice(-4);
+    console.log(`Etherscan API key loaded successfully (${maskedKey}).`);
   }
 
   if (!CRONOS_API_KEY) {
@@ -2510,7 +2603,9 @@ app.listen(PORT, () => {
     console.warn('Cronos chain requests will fail until this is configured.');
     console.warn('---');
   } else {
-    console.log('Cronos API key loaded successfully.');
+    // Mask API key in logs for security
+    const maskedKey = '***' + CRONOS_API_KEY.slice(-4);
+    console.log(`Cronos API key loaded successfully (${maskedKey}).`);
   }
 
   if (!BZR_ADDRESS) {
