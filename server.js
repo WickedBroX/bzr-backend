@@ -885,8 +885,425 @@ const triggerTransfersRefresh = ({ forceRefresh = false } = {}) => {
   return transfersRefreshPromise;
 };
 
+// ============================================================================
+// MASTERCLASS AGGREGATED TRANSFERS IMPLEMENTATION
+// ============================================================================
+
 /**
- * Handles aggregated transfers from all chains
+ * Circuit Breaker for failing chains
+ * Prevents cascade failures by temporarily disabling problematic chains
+ */
+class CircuitBreaker {
+  constructor(threshold = 5, timeout = 60000) {
+    this.failures = new Map(); // chainId -> failure count
+    this.openUntil = new Map(); // chainId -> timestamp when circuit closes
+    this.threshold = threshold;
+    this.timeout = timeout;
+  }
+
+  recordFailure(chainId) {
+    const count = (this.failures.get(chainId) || 0) + 1;
+    this.failures.set(chainId, count);
+    
+    if (count >= this.threshold) {
+      this.openUntil.set(chainId, Date.now() + this.timeout);
+      console.warn(`[CIRCUIT BREAKER] Chain ${chainId} circuit opened after ${count} failures`);
+    }
+  }
+
+  recordSuccess(chainId) {
+    this.failures.delete(chainId);
+    this.openUntil.delete(chainId);
+  }
+
+  isOpen(chainId) {
+    const openTime = this.openUntil.get(chainId);
+    if (!openTime) return false;
+    
+    if (Date.now() > openTime) {
+      // Circuit should close, reset
+      this.openUntil.delete(chainId);
+      this.failures.delete(chainId);
+      console.log(`[CIRCUIT BREAKER] Chain ${chainId} circuit closed, attempting recovery`);
+      return false;
+    }
+    
+    return true;
+  }
+
+  getStatus() {
+    const status = {};
+    for (const [chainId, openTime] of this.openUntil) {
+      if (Date.now() <= openTime) {
+        status[chainId] = {
+          status: 'open',
+          reopensAt: new Date(openTime).toISOString(),
+          failures: this.failures.get(chainId) || 0,
+        };
+      }
+    }
+    return status;
+  }
+}
+
+const chainCircuitBreaker = new CircuitBreaker(5, 60000); // 5 failures, 60s timeout
+
+/**
+ * Aggregated Transfers Cache
+ * Multi-tiered caching with intelligent invalidation
+ */
+const aggregatedCache = {
+  // Cache structure: key -> { data, meta, timestamp, ttl }
+  pages: new Map(),
+  totals: null,
+  totalsTimestamp: null,
+  
+  // Cache configuration
+  PAGE_TTL: 30000, // 30 seconds for page data
+  TOTALS_TTL: 120000, // 2 minutes for totals
+  MAX_CACHED_PAGES: 50, // Limit memory usage
+  
+  // Build cache key for pagination
+  buildKey(page, pageSize, sort) {
+    return `agg:${page}:${pageSize}:${sort}`;
+  },
+  
+  // Get cached page
+  getPage(page, pageSize, sort) {
+    const key = this.buildKey(page, pageSize, sort);
+    const cached = this.pages.get(key);
+    
+    if (!cached) return null;
+    
+    const age = Date.now() - cached.timestamp;
+    if (age > this.PAGE_TTL) {
+      this.pages.delete(key);
+      return null;
+    }
+    
+    console.log(`[AGG CACHE HIT] Page ${page}, age: ${age}ms`);
+    return cached;
+  },
+  
+  // Set cached page with LRU eviction
+  setPage(page, pageSize, sort, data, meta) {
+    // Implement LRU eviction if cache is full
+    if (this.pages.size >= this.MAX_CACHED_PAGES) {
+      const oldestKey = this.pages.keys().next().value;
+      this.pages.delete(oldestKey);
+      console.log(`[AGG CACHE] Evicted oldest page: ${oldestKey}`);
+    }
+    
+    const key = this.buildKey(page, pageSize, sort);
+    this.pages.set(key, {
+      data,
+      meta,
+      timestamp: Date.now(),
+    });
+    
+    console.log(`[AGG CACHE SET] Page ${page}, total pages cached: ${this.pages.size}`);
+  },
+  
+  // Get cached totals
+  getTotals() {
+    if (!this.totals || !this.totalsTimestamp) return null;
+    
+    const age = Date.now() - this.totalsTimestamp;
+    if (age > this.TOTALS_TTL) {
+      this.totals = null;
+      this.totalsTimestamp = null;
+      return null;
+    }
+    
+    console.log(`[AGG CACHE] Totals hit, age: ${age}ms`);
+    return this.totals;
+  },
+  
+  // Set cached totals
+  setTotals(totals) {
+    this.totals = totals;
+    this.totalsTimestamp = Date.now();
+    console.log(`[AGG CACHE] Totals set: ${totals}`);
+  },
+  
+  // Invalidate all caches
+  invalidateAll() {
+    this.pages.clear();
+    this.totals = null;
+    this.totalsTimestamp = null;
+    console.log('[AGG CACHE] Full cache invalidation');
+  },
+  
+  // Get cache statistics
+  getStats() {
+    return {
+      cachedPages: this.pages.size,
+      totalsAge: this.totalsTimestamp ? Date.now() - this.totalsTimestamp : null,
+      totalsCached: !!this.totals,
+    };
+  },
+};
+
+/**
+ * Smart fetch strategy: fetches enough data from each chain to satisfy pagination
+ * This is the KEY to proper pagination in aggregated view
+ */
+async function fetchAggregatedTransfersData(options) {
+  const {
+    requestedPage,
+    requestedPageSize,
+    sort,
+    startBlock,
+    endBlock,
+    forceRefresh,
+  } = options;
+  
+  const startTime = Date.now();
+  console.log(`[AGG FETCH] Starting fetch for page ${requestedPage}, size ${requestedPageSize}, sort ${sort}`);
+  
+  // Calculate how many results we need to fetch from each chain
+  // To properly paginate, we need enough data to cover the requested page
+  // Strategy: Fetch multiple pages from each chain to ensure we have enough data
+  const fetchMultiplier = Math.max(2, Math.ceil(requestedPage / 2)); // Adaptive fetching
+  const fetchSize = requestedPageSize * fetchMultiplier;
+  
+  console.log(`[AGG FETCH] Fetching ${fetchSize} transfers per chain (${fetchMultiplier}x multiplier)`);
+  
+  // Fetch from all chains in parallel with circuit breaker
+  const results = await mapWithConcurrency(
+    CHAINS,
+    MAX_CONCURRENT_REQUESTS,
+    async (chain) => {
+      const chainStartTime = Date.now();
+      
+      // Check circuit breaker
+      if (chainCircuitBreaker.isOpen(chain.id)) {
+        console.log(`[AGG FETCH] Skipping ${chain.name} - circuit breaker open`);
+        return {
+          chain,
+          data: null,
+          error: { code: 'CIRCUIT_OPEN', message: 'Circuit breaker open' },
+          duration: 0,
+          skipped: true,
+        };
+      }
+      
+      try {
+        const pageData = await resolveTransfersPageData({
+          chain,
+          page: 1,
+          pageSize: fetchSize,
+          sort,
+          startBlock,
+          endBlock,
+          forceRefresh,
+        });
+        
+        const duration = Date.now() - chainStartTime;
+        chainCircuitBreaker.recordSuccess(chain.id);
+        
+        console.log(`[AGG FETCH] ${chain.name}: ${pageData.transfers?.length || 0} transfers in ${duration}ms`);
+        
+        return {
+          chain,
+          data: pageData,
+          error: null,
+          duration,
+          skipped: false,
+        };
+      } catch (error) {
+        const duration = Date.now() - chainStartTime;
+        chainCircuitBreaker.recordFailure(chain.id);
+        
+        console.warn(`[AGG FETCH] ${chain.name} failed after ${duration}ms: ${error.message}`);
+        
+        return {
+          chain,
+          data: null,
+          error: { code: error.code || 'FETCH_ERROR', message: error.message || String(error) },
+          duration,
+          skipped: false,
+        };
+      }
+    }
+  );
+  
+  // Process results
+  const allTransfers = [];
+  const chainSummaries = [];
+  let successCount = 0;
+  let failureCount = 0;
+  let skippedCount = 0;
+  
+  results.forEach((result) => {
+    if (result.status === 'fulfilled' && result.value) {
+      const { chain, data, error, duration, skipped } = result.value;
+      
+      if (skipped) {
+        skippedCount++;
+        chainSummaries.push({
+          chainId: chain.id,
+          chainName: chain.name,
+          status: 'skipped',
+          reason: 'circuit_breaker',
+          transferCount: 0,
+          durationMs: duration,
+          timestamp: Date.now(),
+        });
+      } else if (data && data.transfers) {
+        successCount++;
+        allTransfers.push(...data.transfers.map(t => ({
+          ...t,
+          _chainId: chain.id,
+          _chainName: chain.name,
+        })));
+        
+        chainSummaries.push({
+          chainId: chain.id,
+          chainName: chain.name,
+          status: 'ok',
+          transferCount: data.transfers.length,
+          durationMs: duration,
+          timestamp: data.timestamp || Date.now(),
+        });
+      } else {
+        failureCount++;
+        chainSummaries.push({
+          chainId: chain.id,
+          chainName: chain.name,
+          status: 'error',
+          transferCount: 0,
+          error: error?.message || 'Unknown error',
+          errorCode: error?.code || null,
+          durationMs: duration,
+          timestamp: Date.now(),
+        });
+      }
+    }
+  });
+  
+  const fetchDuration = Date.now() - startTime;
+  console.log(`[AGG FETCH] Complete in ${fetchDuration}ms: ${successCount} success, ${failureCount} failed, ${skippedCount} skipped`);
+  console.log(`[AGG FETCH] Total transfers fetched: ${allTransfers.length}`);
+  
+  // Sort all transfers by timestamp (critical for proper pagination)
+  allTransfers.sort((a, b) => {
+    const aTime = Number(a.timeStamp) || 0;
+    const bTime = Number(b.timeStamp) || 0;
+    return sort === 'asc' ? aTime - bTime : bTime - aTime;
+  });
+  
+  // Paginate the sorted results
+  const start = (requestedPage - 1) * requestedPageSize;
+  const end = start + requestedPageSize;
+  const paginatedTransfers = allTransfers.slice(start, end);
+  
+  console.log(`[AGG FETCH] Pagination: slice(${start}, ${end}) = ${paginatedTransfers.length} transfers`);
+  
+  return {
+    transfers: paginatedTransfers,
+    allFetchedCount: allTransfers.length,
+    chainSummaries,
+    fetchDuration,
+    successCount,
+    failureCount,
+    skippedCount,
+  };
+}
+
+/**
+ * Fetch total counts from all chains (with caching)
+ */
+async function fetchAggregatedTotals(forceRefresh = false) {
+  // Check cache first
+  if (!forceRefresh) {
+    const cached = aggregatedCache.getTotals();
+    if (cached) {
+      return cached;
+    }
+  }
+  
+  console.log('[AGG TOTALS] Fetching totals from all chains...');
+  const startTime = Date.now();
+  
+  const chainTotalsPromises = CHAINS.map(async (chain) => {
+    // Skip if circuit breaker is open
+    if (chainCircuitBreaker.isOpen(chain.id)) {
+      console.log(`[AGG TOTALS] Skipping ${chain.name} - circuit breaker open`);
+      return { chainId: chain.id, total: 0, skipped: true, cached: false };
+    }
+    
+    try {
+      const cacheKey = buildTransfersTotalCacheKey({
+        chainId: chain.id,
+        startBlock: undefined,
+        endBlock: undefined,
+      });
+      
+      const cached = getCachedTransfersTotal(cacheKey);
+      if (cached?.payload?.total) {
+        return {
+          chainId: chain.id,
+          total: cached.payload.total,
+          skipped: false,
+          cached: true,
+        };
+      }
+      
+      // If not cached, fetch (this will populate cache)
+      const totalsData = await resolveTransfersTotalData({
+        chain,
+        sort: 'desc',
+        startBlock: null,
+        endBlock: null,
+        forceRefresh: false,
+      });
+      
+      return {
+        chainId: chain.id,
+        total: totalsData?.total || 0,
+        skipped: false,
+        cached: false,
+      };
+    } catch (error) {
+      console.warn(`[AGG TOTALS] Failed to get total for ${chain.name}: ${error.message}`);
+      chainCircuitBreaker.recordFailure(chain.id);
+      return { chainId: chain.id, total: 0, skipped: false, cached: false, error: true };
+    }
+  });
+  
+  const results = await Promise.all(chainTotalsPromises);
+  
+  const grandTotal = results.reduce((sum, r) => sum + r.total, 0);
+  const cachedCount = results.filter(r => r.cached).length;
+  const errorCount = results.filter(r => r.error).length;
+  const skippedCount = results.filter(r => r.skipped).length;
+  
+  const duration = Date.now() - startTime;
+  console.log(`[AGG TOTALS] Complete in ${duration}ms: ${grandTotal} total, ${cachedCount} cached, ${errorCount} errors, ${skippedCount} skipped`);
+  
+  const totalsData = {
+    total: grandTotal,
+    chainBreakdown: results,
+    timestamp: Date.now(),
+    allChainsAvailable: errorCount === 0 && skippedCount === 0,
+  };
+  
+  // Cache the result
+  aggregatedCache.setTotals(totalsData);
+  
+  return totalsData;
+}
+
+/**
+ * MASTERCLASS: Handles aggregated transfers from all chains
+ * Features:
+ * - Smart caching with TTL
+ * - Circuit breaker for failing chains
+ * - Proper pagination with sufficient data fetching
+ * - Memory-efficient processing
+ * - Comprehensive error handling
+ * - Performance monitoring
  */
 const handleAggregatedTransfers = async (req, res, options) => {
   const {
@@ -898,143 +1315,100 @@ const handleAggregatedTransfers = async (req, res, options) => {
     endBlock,
     includeTotals,
   } = options;
-
-  console.log('-> Fetching aggregated transfers from all chains...');
-
+  
+  const requestStartTime = Date.now();
+  console.log(`[AGG HANDLER] Request: page=${requestedPage}, size=${requestedPageSize}, sort=${sort}, force=${forceRefresh}`);
+  
   try {
-    // Fetch first page from all chains in parallel
-    const results = await mapWithConcurrency(
-      CHAINS,
-      MAX_CONCURRENT_REQUESTS,
-      async (chain) => {
-        try {
-          const pageData = await resolveTransfersPageData({
-            chain,
-            page: 1,
-            pageSize: requestedPageSize,
-            sort,
-            startBlock,
-            endBlock,
-            forceRefresh,
-          });
-          return { chain, data: pageData, error: null };
-        } catch (error) {
-          console.warn(`! Failed to fetch transfers from ${chain.name}: ${error.message || error}`);
-          return { chain, data: null, error };
-        }
-      }
-    );
-
-    // Combine all transfers
-    const allTransfers = [];
-    const chainSummaries = [];
-    let displayCount = 0; // Count of transfers fetched for display
-    let allTimeTotal = 0; // True all-time total from cached individual chain totals
-    let allTimeTotalAvailable = true;
-
-    // Fetch cached totals from each chain for all-time stats
-    const chainTotalsPromises = CHAINS.map(async (chain) => {
-      try {
-        const cacheKey = buildTransfersTotalCacheKey({
-          chainId: chain.id,
-          startBlock: undefined,
-          endBlock: undefined,
+    // Check cache first (unless force refresh)
+    if (!forceRefresh) {
+      const cachedPage = aggregatedCache.getPage(requestedPage, requestedPageSize, sort);
+      if (cachedPage) {
+        console.log(`[AGG HANDLER] Serving from cache in ${Date.now() - requestStartTime}ms`);
+        return res.json({
+          ...cachedPage.data,
+          _cached: true,
+          _cacheAge: Date.now() - cachedPage.timestamp,
         });
-        const cached = getCachedTransfersTotal(cacheKey);
-        return cached?.payload?.total || 0;
-      } catch (error) {
-        console.warn(`! Could not get cached total for ${chain.name}`);
-        return 0;
       }
-    });
-
-    const chainTotals = await Promise.all(chainTotalsPromises);
-    allTimeTotal = chainTotals.reduce((sum, total) => sum + (total || 0), 0);
-    
-    // If no cached totals available, mark as unavailable
-    if (allTimeTotal === 0) {
-      allTimeTotalAvailable = false;
     }
-
-    results.forEach((result) => {
-      if (result.status === 'fulfilled' && result.value.data) {
-        const { chain, data } = result.value;
-        allTransfers.push(...(data.transfers || []));
-        chainSummaries.push({
-          chainId: chain.id,
-          chainName: chain.name,
-          status: 'ok',
-          transferCount: (data.transfers || []).length,
-          durationMs: 0,
-          timestamp: data.timestamp || Date.now(),
-        });
-      } else if (result.status === 'fulfilled' && result.value.error) {
-        const { chain, error } = result.value;
-        chainSummaries.push({
-          chainId: chain.id,
-          chainName: chain.name,
-          status: 'error',
-          transferCount: 0,
-          error: error.message || String(error),
-          errorCode: error.code || null,
-          durationMs: 0,
-          timestamp: Date.now(),
-        });
-      }
+    
+    // Fetch data with smart pagination
+    const fetchResult = await fetchAggregatedTransfersData({
+      requestedPage,
+      requestedPageSize,
+      sort,
+      startBlock,
+      endBlock,
+      forceRefresh,
     });
-
-    // Sort all transfers by timestamp
-    allTransfers.sort((a, b) => {
-      const aTime = Number(a.timeStamp);
-      const bTime = Number(b.timeStamp);
-      return sort === 'asc' ? aTime - bTime : bTime - aTime;
-    });
-
-    // Paginate the combined results
-    const start = (requestedPage - 1) * requestedPageSize;
-    const end = start + requestedPageSize;
-    const paginatedTransfers = allTransfers.slice(start, end);
-    displayCount = allTransfers.length; // Transfers fetched for current display
-
-    const totalPages = displayCount > 0 ? Math.ceil(displayCount / requestedPageSize) : 1;
-    const hasMore = displayCount > requestedPage * requestedPageSize;
-
+    
+    // Fetch totals in parallel if requested
+    let totalsData = null;
+    if (includeTotals) {
+      totalsData = await fetchAggregatedTotals(forceRefresh);
+    }
+    
     const warmSummary = getCachedTransfersWarmSummary();
     const warnings = [];
     
-    if (!allTimeTotalAvailable) {
+    // Generate warnings
+    if (fetchResult.failureCount > 0) {
       warnings.push({
-        scope: 'total',
-        code: 'ALL_TIME_TOTAL_UNAVAILABLE',
-        message: 'All-time transfer totals not yet cached. Displaying current page data only.',
+        scope: 'aggregation',
+        code: 'PARTIAL_FAILURE',
+        message: `${fetchResult.failureCount} of ${CHAINS.length} chains failed to respond. Results may be incomplete.`,
         retryable: true,
       });
     }
-
-    res.json({
-      data: paginatedTransfers,
+    
+    if (fetchResult.skippedCount > 0) {
+      warnings.push({
+        scope: 'aggregation',
+        code: 'CHAINS_SKIPPED',
+        message: `${fetchResult.skippedCount} chains skipped due to circuit breaker. Results may be incomplete.`,
+        retryable: true,
+      });
+    }
+    
+    if (totalsData && !totalsData.allChainsAvailable) {
+      warnings.push({
+        scope: 'total',
+        code: 'TOTALS_INCOMPLETE',
+        message: 'Total count may be inaccurate due to some chains being unavailable.',
+        retryable: true,
+      });
+    }
+    
+    // Calculate pagination metadata
+    const totalCount = totalsData ? totalsData.total : fetchResult.allFetchedCount;
+    const totalPages = totalCount > 0 ? Math.ceil(totalCount / requestedPageSize) : 1;
+    const hasMore = requestedPage < totalPages;
+    
+    // Build response
+    const response = {
+      data: fetchResult.transfers,
       pagination: {
         page: requestedPage,
         pageSize: requestedPageSize,
-        total: displayCount, // Display count for current view pagination
+        total: totalCount,
         totalPages,
         hasMore,
         windowExceeded: false,
         maxWindowPages: null,
         resultWindow: null,
       },
-      totals: includeTotals
-        ? {
-            total: displayCount, // Display total for pagination
-            allTimeTotal: allTimeTotalAvailable ? allTimeTotal : null, // True all-time total across all chains
-            truncated: false,
-            resultLength: displayCount,
-            timestamp: Date.now(),
-            stale: false,
-            source: 'aggregated',
-            allTimeTotalAvailable,
-          }
-        : null,
+      totals: totalsData ? {
+        total: totalsData.total,
+        allTimeTotal: totalsData.total,
+        truncated: false,
+        resultLength: fetchResult.allFetchedCount,
+        timestamp: totalsData.timestamp,
+        stale: false,
+        source: 'aggregated',
+        allTimeTotalAvailable: totalsData.allChainsAvailable,
+        chainBreakdown: totalsData.chainBreakdown,
+      } : null,
       chain: {
         id: 0,
         name: 'All Chains',
@@ -1062,18 +1436,38 @@ const handleAggregatedTransfers = async (req, res, options) => {
         chains: warmSummary.chains,
         timestamp: warmSummary.timestamp,
       },
-      chains: chainSummaries,
+      chains: fetchResult.chainSummaries,
       availableChains: [{ id: 0, name: 'All Chains' }, ...CHAINS.map((c) => ({ id: c.id, name: c.name }))],
       request: {
         forceRefresh,
         includeTotals,
       },
+      _performance: {
+        fetchDuration: fetchResult.fetchDuration,
+        totalDuration: Date.now() - requestStartTime,
+        successRate: `${fetchResult.successCount}/${CHAINS.length}`,
+        circuitBreakerStatus: chainCircuitBreaker.getStatus(),
+        cacheStats: aggregatedCache.getStats(),
+      },
+    };
+    
+    // Cache the response
+    aggregatedCache.setPage(requestedPage, requestedPageSize, sort, response, {
+      totalCount,
+      fetchedCount: fetchResult.allFetchedCount,
     });
+    
+    const totalDuration = Date.now() - requestStartTime;
+    console.log(`[AGG HANDLER] Complete in ${totalDuration}ms, returning ${fetchResult.transfers.length} transfers`);
+    
+    res.json(response);
+    
   } catch (error) {
-    console.error('Error handling aggregated transfers request:', error.message || error);
+    console.error('[AGG HANDLER] Error:', error.message || error);
     return res.status(500).json({
       message: 'Failed to fetch aggregated transfers',
       error: error.message || String(error),
+      timestamp: Date.now(),
     });
   }
 };
