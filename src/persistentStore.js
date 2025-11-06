@@ -269,7 +269,19 @@ const storeTransfers = async (chainId, transfers = []) => {
     .map((transfer) => normalizeTransferRecord(chainId, transfer))
     .filter((record) => record.txHash);
 
-  if (normalized.length === 0) {
+  const uniqueRecords = [];
+  const seenKeys = new Set();
+
+  for (const record of normalized) {
+    const key = `${record.chainId}:${record.txHash}:${record.logIndex}`;
+    if (seenKeys.has(key)) {
+      continue;
+    }
+    seenKeys.add(key);
+    uniqueRecords.push(record);
+  }
+
+  if (uniqueRecords.length === 0) {
     return { inserted: 0 };
   }
 
@@ -285,7 +297,7 @@ const storeTransfers = async (chainId, transfers = []) => {
       value,
       method_id,
       payload
-    ) VALUES ${normalized
+    ) VALUES ${uniqueRecords
       .map((_, index) => `($${index * 10 + 1}, $${index * 10 + 2}, $${index * 10 + 3}, $${index * 10 + 4}, $${index * 10 + 5}, $${index * 10 + 6}, $${index * 10 + 7}, $${index * 10 + 8}, $${index * 10 + 9}, $${index * 10 + 10})`)
       .join(', ')}
     ON CONFLICT (chain_id, tx_hash, log_index) DO UPDATE SET
@@ -299,7 +311,7 @@ const storeTransfers = async (chainId, transfers = []) => {
       inserted_at = NOW();
   `;
 
-  const values = normalized.flatMap((record) => [
+  const values = uniqueRecords.flatMap((record) => [
     record.chainId,
     record.blockNumber,
     record.txHash,

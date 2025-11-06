@@ -1,0 +1,21 @@
+version: '3.9'
+services:
+  bzr-postgres:
+    image: postgres:16-alpine
+    container_name: bzr-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${TRANSFERS_DB_NAME:-bzr_transfers}
+      POSTGRES_USER: ${TRANSFERS_DB_USER:-bzr}
+      POSTGRES_PASSWORD: ${TRANSFERS_DB_PASSWORD:-change_me}
+    ports:
+      - "5432:5432"
+    volumes:
+      - bzr-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${TRANSFERS_DB_USER:-bzr} -d ${TRANSFERS_DB_NAME:-bzr_transfers}"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+volumes:
+  bzr-postgres-data:

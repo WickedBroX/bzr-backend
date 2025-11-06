@@ -3620,6 +3620,34 @@ app.get('/api/health', async (req, res) => {
   }, null);
   const ready = Boolean(storeEnabled && storeReadyFlag) && (snapshots.length > 0 ? snapshots.every((snapshot) => snapshot.ready) : true);
   const stale = typeof indexLagSec === 'number' ? indexLagSec > INGEST_STALE_THRESHOLD_SECONDS : !ready;
+  const chainsReadyCount = snapshots.filter((snapshot) => snapshot.ready).length;
+  const chainsStaleCount = snapshots.filter((snapshot) => snapshot.stale).length;
+  const chainsFailingCount = snapshots.filter((snapshot) => (snapshot.consecutiveFailures || 0) > 0).length;
+  const maxConsecutiveFailures = snapshots.reduce((max, snapshot) => {
+    const failures = Number(snapshot.consecutiveFailures || 0);
+    return Number.isFinite(failures) ? Math.max(max, failures) : max;
+  }, 0);
+  const maxBackoffUntilMs = snapshots.reduce((latest, snapshot) => {
+    if (!snapshot.backoffUntil) {
+      return latest;
+    }
+    const value = Date.parse(snapshot.backoffUntil);
+    if (!Number.isFinite(value)) {
+      return latest;
+    }
+    return !latest || value > latest ? value : latest;
+  }, null);
+  const maxBackoffUntilIso = typeof maxBackoffUntilMs === 'number' ? new Date(maxBackoffUntilMs).toISOString() : null;
+  const ingesterSupervisor = process.env.INGESTER_SUPERVISOR || 'systemd';
+  const ingesterStatus = !storeEnabled
+    ? 'disabled'
+    : !storeReadyFlag
+      ? 'initializing'
+      : (chainsFailingCount > 0 || stale)
+        ? 'degraded'
+        : ready
+          ? 'ok'
+          : 'initializing';
 
   if (!storeEnabled) {
     warningItems.push({
@@ -3651,6 +3679,15 @@ app.get('/api/health', async (req, res) => {
       scope: 'ingester',
       code: 'STORE_DATA_STALE',
       message: 'Latest ingested data is stale; serving last successful snapshot.',
+      retryable: true,
+    });
+  }
+
+  if (chainsFailingCount > 0) {
+    warningItems.push({
+      scope: 'ingester',
+      code: 'INGESTER_FAILURES',
+      message: `${chainsFailingCount} chain(s) reporting repeated ingestion failures.`,
       retryable: true,
     });
   }
@@ -3722,10 +3759,19 @@ app.get('/api/health', async (req, res) => {
         status: 'ok',
       },
       ingester: {
-        managedBy: 'systemd',
-        status: stale ? 'degraded' : (ready ? 'ok' : 'initializing'),
+        managedBy: ingesterSupervisor,
+        status: ingesterStatus,
         lastSuccessAt: lastSuccessAt ? new Date(lastSuccessAt).toISOString() : null,
         lastErrorAt: lastErrorAt ? new Date(lastErrorAt).toISOString() : null,
+        summary: {
+          chains: snapshots.length,
+          chainsReady: chainsReadyCount,
+          chainsStale: chainsStaleCount,
+          chainsFailing: chainsFailingCount,
+          maxConsecutiveFailures,
+          maxBackoffUntil: maxBackoffUntilIso,
+          maxLagSeconds: typeof indexLagSec === 'number' ? indexLagSec : null,
+        },
       },
     },
     warnings: warningItems,
@@ -3930,6 +3976,14 @@ app.listen(PORT, () => {
     console.warn('WARNING: BZR_TOKEN_ADDRESS is not set. Please set it in .env');
   } else {
     console.log(`Tracking BZR Token: ${BZR_ADDRESS}`);
+  }
+
+  if (TRANSFERS_DATA_SOURCE === 'store' || TRANSFERS_DATA_SOURCE === 'persistent') {
+    bootstrapPersistentStore().catch((error) => {
+      console.error('X Persistent store initialization failed:', error.message || error);
+    });
+  } else {
+    console.log(`! Persistent store disabled (TRANSFERS_DATA_SOURCE=${TRANSFERS_DATA_SOURCE}).`);
   }
 
   if (CACHE_WARM_INTERVAL_MS > 0) {

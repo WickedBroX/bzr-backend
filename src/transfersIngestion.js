@@ -1,6 +1,13 @@
 'use strict';
 
-const pLimit = require('p-limit');
+const pLimitModule = require('p-limit');
+const pLimit = typeof pLimitModule === 'function'
+  ? pLimitModule
+  : (pLimitModule && typeof pLimitModule.default === 'function'
+    ? pLimitModule.default
+    : () => {
+        throw new Error('p-limit module did not provide a callable export');
+      });
 const {
   storeTransfers,
   updateIngestCursor,

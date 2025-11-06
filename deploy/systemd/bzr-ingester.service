@@ -1,0 +1,19 @@
+[Unit]
+Description=BZR Persistent Transfer Ingester
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/www/bzr-backend
+EnvironmentFile=-/var/www/bzr-backend/.env
+Environment=NODE_ENV=production
+ExecStart=/var/www/bzr-backend/scripts/start-ingester.sh
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target
