@@ -3286,7 +3286,11 @@ app.get('/api/transfers', async (req, res) => {
   }
 
   const forceRefresh = String(req.query.force).toLowerCase() === 'true';
-  const requestedChainId = Number(req.query.chainId || 0);
+  // Handle 'all' chainId as 0 for cross-chain queries
+  const chainIdParam = req.query.chainId;
+  const requestedChainId = (chainIdParam === 'all' || chainIdParam === '0' || !chainIdParam) 
+    ? 0 
+    : Number(chainIdParam);
   const requestedPage = normalizePageNumber(req.query.page || 1);
   const requestedPageSize = clampTransfersPageSize(req.query.pageSize || TRANSFERS_DEFAULT_PAGE_SIZE);
   const sortParam = typeof req.query.sort === 'string' ? req.query.sort.toLowerCase() : 'desc';
