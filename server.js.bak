@@ -3174,8 +3174,8 @@ app.get('/api/info', strictLimiter, cacheMiddleware(300), async (req, res) => {
       const dbResult = await dbQuery(
         `SELECT 
           token_name, token_symbol, token_decimals,
-          total_supply, formatted_total_supply,
-          circulating_supply, formatted_circulating_supply,
+          total_supply_raw, total_supply_formatted,
+          circulating_supply_raw, circulating_supply_formatted,
           updated_at
          FROM token_info 
          WHERE contract_address = $1 
@@ -3190,10 +3190,10 @@ app.get('/api/info', strictLimiter, cacheMiddleware(300), async (req, res) => {
           tokenName: row.token_name,
           tokenSymbol: row.token_symbol,
           tokenDecimal: row.token_decimals,
-          totalSupply: row.total_supply,
-          circulatingSupply: row.circulating_supply,
-          formattedTotalSupply: row.formatted_total_supply,
-          formattedCirculatingSupply: row.formatted_circulating_supply,
+          totalSupply: row.total_supply_raw,
+          circulatingSupply: row.circulating_supply_raw,
+          formattedTotalSupply: row.total_supply_formatted,
+          formattedCirculatingSupply: row.circulating_supply_formatted,
           _source: 'database',
           _updatedAt: row.updated_at,
         };
@@ -3254,8 +3254,8 @@ app.get('/api/info', strictLimiter, cacheMiddleware(300), async (req, res) => {
       const fallbackResult = await dbQuery(
         `SELECT 
           token_name, token_symbol, token_decimals,
-          total_supply, formatted_total_supply,
-          circulating_supply, formatted_circulating_supply,
+          total_supply_raw, total_supply_formatted,
+          circulating_supply_raw, circulating_supply_formatted,
           updated_at
          FROM token_info 
          WHERE contract_address = $1 
@@ -3270,10 +3270,10 @@ app.get('/api/info', strictLimiter, cacheMiddleware(300), async (req, res) => {
           tokenName: row.token_name,
           tokenSymbol: row.token_symbol,
           tokenDecimal: row.token_decimals,
-          totalSupply: row.total_supply,
-          circulatingSupply: row.circulating_supply,
-          formattedTotalSupply: row.formatted_total_supply,
-          formattedCirculatingSupply: row.formatted_circulating_supply,
+          totalSupply: row.total_supply_raw,
+          circulatingSupply: row.circulating_supply_raw,
+          formattedTotalSupply: row.total_supply_formatted,
+          formattedCirculatingSupply: row.circulating_supply_formatted,
           _source: 'database_fallback',
           _updatedAt: row.updated_at,
           _warning: 'Upstream API unavailable, showing cached data',
@@ -3321,8 +3321,8 @@ app.get('/api/info', strictLimiter, cacheMiddleware(300), async (req, res) => {
       await dbQuery(
         `INSERT INTO token_info (
           contract_address, chain_id, token_name, token_symbol, token_decimals,
-          total_supply, formatted_total_supply,
-          circulating_supply, formatted_circulating_supply,
+          total_supply_raw, total_supply_formatted,
+          circulating_supply_raw, circulating_supply_formatted,
           source_data, last_fetch_success, updated_at
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true, NOW())
         ON CONFLICT (contract_address) 
@@ -3331,10 +3331,10 @@ app.get('/api/info', strictLimiter, cacheMiddleware(300), async (req, res) => {
           token_name = EXCLUDED.token_name,
           token_symbol = EXCLUDED.token_symbol,
           token_decimals = EXCLUDED.token_decimals,
-          total_supply = EXCLUDED.total_supply,
-          formatted_total_supply = EXCLUDED.formatted_total_supply,
-          circulating_supply = EXCLUDED.circulating_supply,
-          formatted_circulating_supply = EXCLUDED.formatted_circulating_supply,
+          total_supply_raw = EXCLUDED.total_supply_raw,
+          total_supply_formatted = EXCLUDED.total_supply_formatted,
+          circulating_supply_raw = EXCLUDED.circulating_supply_raw,
+          circulating_supply_formatted = EXCLUDED.circulating_supply_formatted,
           source_data = EXCLUDED.source_data,
           last_fetch_success = true,
           last_fetch_error = NULL,
@@ -3385,8 +3385,8 @@ app.get('/api/info', strictLimiter, cacheMiddleware(300), async (req, res) => {
       const emergencyResult = await dbQuery(
         `SELECT 
           token_name, token_symbol, token_decimals,
-          total_supply, formatted_total_supply,
-          circulating_supply, formatted_circulating_supply,
+          total_supply_raw, total_supply_formatted,
+          circulating_supply_raw, circulating_supply_formatted,
           updated_at
          FROM token_info 
          WHERE contract_address = $1 
@@ -3401,10 +3401,10 @@ app.get('/api/info', strictLimiter, cacheMiddleware(300), async (req, res) => {
           tokenName: row.token_name,
           tokenSymbol: row.token_symbol,
           tokenDecimal: row.token_decimals,
-          totalSupply: row.total_supply,
-          circulatingSupply: row.circulating_supply,
-          formattedTotalSupply: row.formatted_total_supply,
-          formattedCirculatingSupply: row.formatted_circulating_supply,
+          totalSupply: row.total_supply_raw,
+          circulatingSupply: row.circulating_supply_raw,
+          formattedTotalSupply: row.total_supply_formatted,
+          formattedCirculatingSupply: row.circulating_supply_formatted,
           _source: 'database_emergency',
           _updatedAt: row.updated_at,
           _warning: 'Error occurred, showing last known data',
