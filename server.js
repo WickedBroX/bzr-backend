@@ -3474,6 +3474,294 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
 
+// --- Search Functionality ---
+
+// Helper function to detect search type
+const detectSearchType = (query) => {
+  if (!query || typeof query !== 'string') {
+    return 'unknown';
+  }
+
+  const trimmed = query.trim().toLowerCase();
+
+  // Ethereum address: 0x followed by 40 hex characters
+  if (/^0x[a-f0-9]{40}$/i.test(trimmed)) {
+    return 'address';
+  }
+
+  // Transaction hash: 0x followed by 64 hex characters
+  if (/^0x[a-f0-9]{64}$/i.test(trimmed)) {
+    return 'transaction';
+  }
+
+  // Block number: pure digits
+  if (/^\d+$/.test(trimmed)) {
+    return 'block';
+  }
+
+  // ENS domain: ends with .eth
+  if (trimmed.endsWith('.eth')) {
+    return 'ens';
+  }
+
+  return 'unknown';
+};
+
+// Search by transaction hash across all chains
+const searchByTransaction = async (txHash) => {
+  console.log(`[SEARCH] Looking for transaction: ${txHash}`);
+  
+  // First, try to find in our database
+  try {
+    const dbResult = await dbQuery(
+      `SELECT 
+        tx_hash, block_number, timestamp, 
+        from_address, to_address, value, 
+        chain_id, chain_name
+       FROM transfer_events 
+       WHERE tx_hash = $1 
+       LIMIT 1`,
+      [txHash.toLowerCase()]
+    );
+
+    if (dbResult.rows.length > 0) {
+      const tx = dbResult.rows[0];
+      console.log(`-> Found transaction in database on chain ${tx.chain_name}`);
+      
+      return {
+        source: 'database',
+        type: 'transaction',
+        found: true,
+        data: {
+          hash: tx.tx_hash,
+          blockNumber: tx.block_number,
+          timestamp: tx.timestamp,
+          from: tx.from_address,
+          to: tx.to_address,
+          value: tx.value,
+          chainId: tx.chain_id,
+          chainName: tx.chain_name,
+        }
+      };
+    }
+  } catch (dbError) {
+    console.error('-> Database search error:', dbError.message);
+  }
+
+  // If not in database, search across all chains via Etherscan
+  console.log('-> Transaction not in database, searching blockchain explorers...');
+  
+  for (const chain of CHAINS) {
+    try {
+      const provider = getProviderConfigForChain(chain, { requireApiKey: false });
+      const apiKey = getNextApiKey();
+      
+      const url = `${provider.baseURL}?module=proxy&action=eth_getTransactionByHash&txhash=${txHash}&apikey=${apiKey}`;
+      
+      const response = await axios.get(url, { timeout: 5000 });
+      
+      if (response.data && response.data.result && response.data.result.blockNumber) {
+        const tx = response.data.result;
+        console.log(`-> Found transaction on ${chain.name}`);
+        
+        return {
+          source: 'blockchain',
+          type: 'transaction',
+          found: true,
+          data: {
+            hash: tx.hash,
+            blockNumber: parseInt(tx.blockNumber, 16),
+            from: tx.from,
+            to: tx.to,
+            value: tx.value,
+            gasUsed: tx.gas,
+            chainId: chain.id,
+            chainName: chain.name,
+          }
+        };
+      }
+    } catch (error) {
+      // Continue to next chain
+      continue;
+    }
+  }
+
+  console.log('-> Transaction not found on any chain');
+  return {
+    source: 'none',
+    type: 'transaction',
+    found: false,
+    error: 'Transaction not found on any supported chain'
+  };
+};
+
+// Search by address (returns guidance to filter)
+const searchByAddress = async (address) => {
+  console.log(`[SEARCH] Address search: ${address}`);
+  
+  // Validate address exists in our database
+  try {
+    const dbResult = await dbQuery(
+      `SELECT COUNT(*) as count, 
+              COUNT(DISTINCT chain_id) as chains
+       FROM transfer_events 
+       WHERE from_address = $1 OR to_address = $1
+       LIMIT 1`,
+      [address.toLowerCase()]
+    );
+
+    const { count, chains } = dbResult.rows[0];
+    
+    return {
+      source: 'database',
+      type: 'address',
+      found: parseInt(count) > 0,
+      data: {
+        address: address,
+        transferCount: parseInt(count),
+        chainCount: parseInt(chains),
+        message: parseInt(count) > 0 
+          ? `Found ${count} transfers across ${chains} chain(s)` 
+          : 'No transfers found for this address'
+      }
+    };
+  } catch (error) {
+    console.error('-> Address search error:', error.message);
+    return {
+      source: 'database',
+      type: 'address',
+      found: false,
+      error: 'Failed to search address'
+    };
+  }
+};
+
+// Search by block number
+const searchByBlock = async (blockNumber, chainId = null) => {
+  console.log(`[SEARCH] Block search: ${blockNumber}${chainId ? ` on chain ${chainId}` : ''}`);
+  
+  try {
+    let query;
+    let params;
+    
+    if (chainId) {
+      query = `SELECT COUNT(*) as count 
+               FROM transfer_events 
+               WHERE block_number = $1 AND chain_id = $2`;
+      params = [blockNumber, chainId];
+    } else {
+      query = `SELECT COUNT(*) as count,
+                      COUNT(DISTINCT chain_id) as chains
+               FROM transfer_events 
+               WHERE block_number = $1`;
+      params = [blockNumber];
+    }
+
+    const dbResult = await dbQuery(query, params);
+    const { count, chains } = dbResult.rows[0];
+    
+    return {
+      source: 'database',
+      type: 'block',
+      found: parseInt(count) > 0,
+      data: {
+        blockNumber: blockNumber,
+        chainId: chainId,
+        transferCount: parseInt(count),
+        chainCount: chains ? parseInt(chains) : 1,
+        message: parseInt(count) > 0
+          ? `Found ${count} transfers in block ${blockNumber}`
+          : `No transfers found in block ${blockNumber}`
+      }
+    };
+  } catch (error) {
+    console.error('-> Block search error:', error.message);
+    return {
+      source: 'database',
+      type: 'block',
+      found: false,
+      error: 'Failed to search block'
+    };
+  }
+};
+
+// Main search endpoint
+app.get('/api/search', strictLimiter, async (req, res) => {
+  console.log(`[${new Date().toISOString()}] Received request for /api/search`);
+  
+  const { query, type, chainId } = req.query;
+
+  if (!query) {
+    return res.status(400).json({ 
+      error: 'Missing query parameter',
+      message: 'Please provide a query parameter (address, transaction hash, or block number)'
+    });
+  }
+
+  // Detect or use provided search type
+  const searchType = type || detectSearchType(query);
+
+  if (searchType === 'unknown') {
+    return res.status(400).json({
+      error: 'Invalid search query',
+      message: 'Query must be an Ethereum address (0x + 40 chars), transaction hash (0x + 64 chars), or block number',
+      detectedType: searchType,
+      query: query
+    });
+  }
+
+  try {
+    let result;
+
+    switch (searchType) {
+      case 'address':
+        result = await searchByAddress(query);
+        break;
+
+      case 'transaction':
+        result = await searchByTransaction(query);
+        break;
+
+      case 'block':
+        const blockNum = parseInt(query);
+        const chain = chainId ? parseInt(chainId) : null;
+        result = await searchByBlock(blockNum, chain);
+        break;
+
+      case 'ens':
+        // ENS resolution would go here (future enhancement)
+        return res.status(501).json({
+          error: 'ENS resolution not yet implemented',
+          message: 'ENS domain resolution is coming soon!',
+          query: query
+        });
+
+      default:
+        return res.status(400).json({
+          error: 'Unsupported search type',
+          detectedType: searchType
+        });
+    }
+
+    console.log(`-> Search completed: ${searchType} - ${result.found ? 'FOUND' : 'NOT FOUND'}`);
+    
+    return res.json({
+      success: true,
+      searchType: searchType,
+      query: query,
+      ...result
+    });
+
+  } catch (error) {
+    console.error('X Search error:', error);
+    return res.status(500).json({
+      error: 'Search failed',
+      message: error.message || 'An unexpected error occurred during search'
+    });
+  }
+});
+
+
 // [Milestone 2.2] - All Transfers (Implementation)
 app.get('/api/transfers', async (req, res) => {
   console.log(`[${new Date().toISOString()}] Received request for /api/transfers`);
