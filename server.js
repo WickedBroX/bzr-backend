@@ -3515,9 +3515,9 @@ const searchByTransaction = async (txHash) => {
   try {
     const dbResult = await dbQuery(
       `SELECT 
-        tx_hash, block_number, timestamp, 
+        tx_hash, block_number, time_stamp, 
         from_address, to_address, value, 
-        chain_id, chain_name
+        chain_id
        FROM transfer_events 
        WHERE tx_hash = $1 
        LIMIT 1`,
@@ -3526,7 +3526,9 @@ const searchByTransaction = async (txHash) => {
 
     if (dbResult.rows.length > 0) {
       const tx = dbResult.rows[0];
-      console.log(`-> Found transaction in database on chain ${tx.chain_name}`);
+      const chain = getChainDefinition(tx.chain_id);
+      const chainName = chain ? chain.name : `Chain ${tx.chain_id}`;
+      console.log(`-> Found transaction in database on chain ${chainName}`);
       
       return {
         source: 'database',
@@ -3535,12 +3537,12 @@ const searchByTransaction = async (txHash) => {
         data: {
           hash: tx.tx_hash,
           blockNumber: tx.block_number,
-          timestamp: tx.timestamp,
+          timestamp: tx.time_stamp,
           from: tx.from_address,
           to: tx.to_address,
           value: tx.value,
           chainId: tx.chain_id,
-          chainName: tx.chain_name,
+          chainName: chainName,
         }
       };
     }
@@ -3595,6 +3597,7 @@ const searchByTransaction = async (txHash) => {
   };
 };
 
+// Search by block hash
 // Search by address (returns guidance to filter)
 const searchByAddress = async (address) => {
   console.log(`[SEARCH] Address search: ${address}`);
