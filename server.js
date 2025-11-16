@@ -3934,12 +3934,23 @@ app.get('/api/holders', strictLimiter, cacheMiddleware(180), async (req, res) =>
       });
     }
 
-    const holders = Array.isArray(response.data.result) ? response.data.result : [];
-    
-    console.log(`-> Fetched ${holders.length} holders for ${chain.name} (page ${page})`);
+    const rawHolders = Array.isArray(response.data.result) ? response.data.result : [];
+
+    // Filter out zero-balance and dust holders to better match what we display in the UI
+    // Etherscan can return extremely small balances (a few wei) which show up as 0 BZR in the app.
+    const DUST_THRESHOLD = 1e-6; // 0.000001 BZR
+
+    const filteredHolders = rawHolders.filter((holder) => {
+      const raw = parseFloat(holder.TokenHolderQuantity || '0');
+      if (!Number.isFinite(raw) || raw <= 0) return false;
+      const bzr = raw / Math.pow(10, 18);
+      return bzr >= DUST_THRESHOLD;
+    });
+
+    console.log(`-> Fetched ${rawHolders.length} holders for ${chain.name} (page ${page}), after filtering: ${filteredHolders.length}`);
     
     res.json({
-      data: holders,
+      data: filteredHolders,
       chain: {
         id: chain.id,
         name: chain.name,
@@ -3947,7 +3958,8 @@ app.get('/api/holders', strictLimiter, cacheMiddleware(180), async (req, res) =>
       pagination: {
         page,
         pageSize,
-        resultCount: holders.length,
+        resultCount: filteredHolders.length,
+        totalRaw: rawHolders.length,
       },
       timestamp: Date.now(),
     });
